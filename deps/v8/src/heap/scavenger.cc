@@ -4,6 +4,8 @@
 
 #include "src/heap/scavenger.h"
 
+#include <atomic>
+
 #include "src/common/globals.h"
 #include "src/handles/global-handles.h"
 #include "src/heap/array-buffer-sweeper.h"
@@ -13,6 +15,7 @@
 #include "src/heap/gc-tracer.h"
 #include "src/heap/heap-inl.h"
 #include "src/heap/heap.h"
+#include "src/heap/large-page-inl.h"
 #include "src/heap/mark-compact-inl.h"
 #include "src/heap/mark-compact.h"
 #include "src/heap/memory-chunk-layout.h"
@@ -208,6 +211,8 @@ void ScavengerCollector::JobTask::Run(JobDelegate* delegate) {
   // In case multi-cage pointer compression mode is enabled ensure that
   // current thread's cage base values are properly initialized.
   PtrComprCageAccessScope ptr_compr_cage_access_scope(outer_->heap_->isolate());
+
+  outer_->estimate_concurrency_.fetch_add(1, std::memory_order_relaxed);
 
   Scavenger* scavenger = (*scavengers_)[delegate->GetTaskId()].get();
   if (delegate->IsJoiningThread()) {
@@ -436,6 +441,9 @@ void ScavengerCollector::CollectGarbage() {
       scavengers.clear();
 
       HandleSurvivingNewLargeObjects();
+
+      heap_->tracer()->SampleConcurrencyEsimate(
+          FetchAndResetConcurrencyEstimate());
     }
   }
 
@@ -508,10 +516,7 @@ void ScavengerCollector::CollectGarbage() {
 #endif
   }
 
-  {
-    TRACE_GC(heap_->tracer(), GCTracer::Scope::SCAVENGER_SWEEP_ARRAY_BUFFERS);
-    SweepArrayBufferExtensions();
-  }
+  SweepArrayBufferExtensions();
 
   isolate_->global_handles()->UpdateListOfYoungNodes();
   isolate_->traced_handles()->UpdateListOfYoungNodes();
@@ -645,8 +650,6 @@ Scavenger::Scavenger(ScavengerCollector* collector, Heap* heap, bool is_logging,
       ephemeron_table_list_local_(*ephemeron_table_list),
       pretenuring_handler_(heap_->pretenuring_handler()),
       local_pretenuring_feedback_(PretenuringHandler::kInitialFeedbackCapacity),
-      copied_size_(0),
-      promoted_size_(0),
       allocator_(heap, CompactionSpaceKind::kCompactionSpaceForScavenge),
       shared_old_allocator_(CreateSharedOldAllocator(heap_)),
       is_logging_(is_logging),

@@ -300,9 +300,6 @@ void ConcurrentMarking::RunMajor(JobDelegate* delegate,
     PtrComprCageBase cage_base(isolate);
     bool is_per_context_mode = local_marking_worklists.IsPerContextMode();
     bool done = false;
-    CodePageHeaderModificationScope rwx_write_scope(
-        "Marking a InstructionStream object requires write access to the "
-        "Code page header");
     while (!done) {
       size_t current_marked_bytes = 0;
       int objects_processed = 0;
@@ -510,6 +507,10 @@ void ConcurrentMarking::RunMinor(JobDelegate* delegate) {
   {
     TimedScope scope(&time_ms);
     if (heap_->minor_mark_sweep_collector()->is_in_atomic_pause()) {
+      // This gets a lower bound for estimated concurrency as we may have marked
+      // most of the graph concurrently already and may not be using parallism
+      // as much.
+      estimate_concurrency_.fetch_add(1, std::memory_order_relaxed);
       marked_bytes =
           RunMinorImpl<YoungGenerationMarkingVisitationMode::kParallel>(
               delegate, task_state);

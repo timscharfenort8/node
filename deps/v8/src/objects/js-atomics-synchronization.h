@@ -21,9 +21,11 @@ namespace internal {
 #include "torque-generated/src/objects/js-atomics-synchronization-tq.inc"
 
 namespace detail {
+class WaiterQueueLockGuard;
 class WaiterQueueNode;
 }  // namespace detail
 
+using detail::WaiterQueueLockGuard;
 using detail::WaiterQueueNode;
 
 // JSSynchronizationPrimitive is the base class for JSAtomicsMutex and
@@ -38,6 +40,8 @@ class JSSynchronizationPrimitive
   // Synchronization only store raw data as state.
   static constexpr int kEndOfTaggedFieldsOffset = JSObject::kHeaderSize;
   class BodyDescriptor;
+
+  Tagged<Object> NumWaitersForTesting(Isolate* requester);
 
   TQ_OBJECT_CONSTRUCTORS(JSSynchronizationPrimitive)
   inline void SetNullWaiterQueueHead();
@@ -75,12 +79,25 @@ class JSSynchronizationPrimitive
                                    WaiterQueueNode* waiter_head,
                                    StateT new_state);
 
+  // Set the new state without modifying bits outside the waiter queue mask.
+  static void SetWaiterQueueStateOnly(std::atomic<StateT>* state,
+                                      StateT new_state);
+
+  static bool TryLockWaiterQueueExplicit(std::atomic<StateT>* state,
+                                         StateT& expected);
+
   using TorqueGeneratedJSSynchronizationPrimitive<
       JSSynchronizationPrimitive, AlwaysSharedSpaceJSObject>::state;
   using TorqueGeneratedJSSynchronizationPrimitive<
       JSSynchronizationPrimitive, AlwaysSharedSpaceJSObject>::set_state;
 
+  static constexpr StateT kEmptyState = 0;
+  static constexpr StateT kWaiterQueueMask =
+      base::BitFieldUnion<HasWaitersField, IsWaiterQueueLockedField>::kMask;
+
  private:
+  friend class WaiterQueueLockGuard;
+
 #if V8_COMPRESS_POINTERS
   // When pointer compression is enabled, the pointer to the waiter queue head
   // is stored in the external pointer table and the object itself only contains
@@ -210,7 +227,7 @@ class JSAtomicsMutex
   // and whether the lock itself is locked (IsLockedField).
   using IsLockedField = JSSynchronizationPrimitive::NextBitField<bool, 1>;
 
-  static constexpr StateT kUnlockedUncontended = 0;
+  static constexpr StateT kUnlockedUncontended = kEmptyState;
   static constexpr StateT kLockedUncontended = IsLockedField::encode(true);
 
   inline void SetCurrentThreadAsOwner();
@@ -230,10 +247,10 @@ class JSAtomicsMutex
                                           WaiterQueueNode* timed_out_waiter);
 
   static bool TryLockExplicit(std::atomic<StateT>* state, StateT& expected);
-  static bool TryLockWaiterQueueExplicit(std::atomic<StateT>* state,
-                                         StateT& expected);
-  static void UnlockWaiterQueueWithNewState(std::atomic<StateT>* state,
-                                            StateT new_state);
+  // Returns nullopt if the JS mutex is acquired, otherwise return an optional
+  // with a `WaiterQueueLockGuard` object.
+  static std::optional<WaiterQueueLockGuard> LockWaiterQueueOrJSMutex(
+      std::atomic<StateT>* state, StateT& current_state);
 
   using TorqueGeneratedJSAtomicsMutex<
       JSAtomicsMutex, JSSynchronizationPrimitive>::owner_thread_id;
@@ -296,24 +313,17 @@ class JSAtomicsCondition
                                            Handle<JSAtomicsCondition> cv,
                                            uint32_t count);
 
-  Tagged<Object> NumWaitersForTesting(Isolate* isolate);
-
   TQ_OBJECT_CONSTRUCTORS(JSAtomicsCondition)
 
  private:
   friend class Factory;
   friend class WaiterQueueNode;
 
-  static constexpr StateT kEmptyState = 0;
-
-  static bool TryLockWaiterQueueExplicit(std::atomic<StateT>* state,
-                                         StateT& expected);
-
-  using DequeueAction = std::function<WaiterQueueNode*(WaiterQueueNode**)>;
-  static WaiterQueueNode* DequeueExplicit(Isolate* requester,
-                                          Handle<JSAtomicsCondition> cv,
-                                          std::atomic<StateT>* state,
-                                          const DequeueAction& dequeue_action);
+  using DequeueAction = std::function<uint32_t(WaiterQueueNode**)>;
+  static uint32_t DequeueExplicit(Isolate* requester,
+                                  Handle<JSAtomicsCondition> cv,
+                                  std::atomic<StateT>* state,
+                                  const DequeueAction& dequeue_action);
 };
 
 }  // namespace internal

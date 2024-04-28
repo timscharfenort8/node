@@ -22,6 +22,10 @@
 namespace v8 {
 namespace internal {
 
+namespace compiler {
+class DeoptimizationLiteral;
+}
+
 class RegisterValues;
 class TranslatedState;
 
@@ -67,6 +71,7 @@ class TranslatedValue {
   friend class TranslatedState;
   friend class TranslatedFrame;
   friend class Deoptimizer;
+  friend class DeoptimizationLiteralProvider;
 
   enum Kind : uint8_t {
     kInvalid,
@@ -195,6 +200,7 @@ class TranslatedFrame {
 #if V8_ENABLE_WEBASSEMBLY
     kWasmInlinedIntoJS,
     kJSToWasmBuiltinContinuation,
+    kLiftoffFunction,
 #endif  // V8_ENABLE_WEBASSEMBLY
     kJavaScriptBuiltinContinuation,
     kJavaScriptBuiltinContinuationWithCatch,
@@ -304,6 +310,7 @@ class TranslatedFrame {
   static TranslatedFrame JSToWasmBuiltinContinuationFrame(
       BytecodeOffset bailout_id, Tagged<SharedFunctionInfo> shared_info,
       int height, base::Optional<wasm::ValueKind> return_type);
+  static TranslatedFrame LiftoffFrame(BytecodeOffset bailout_id, int height);
 #endif  // V8_ENABLE_WEBASSEMBLY
   static TranslatedFrame JavaScriptBuiltinContinuationFrame(
       BytecodeOffset bailout_id, Tagged<SharedFunctionInfo> shared_info,
@@ -399,8 +406,7 @@ class TranslatedState {
   Isolate* isolate() { return isolate_; }
 
   void Init(Isolate* isolate, Address input_frame_pointer,
-            Address stack_frame_pointer,
-            DeoptimizationFrameTranslation::Iterator* iterator,
+            Address stack_frame_pointer, DeoptTranslationIterator* iterator,
             Tagged<DeoptimizationLiteralArray> literal_array,
             RegisterValues* registers, FILE* trace_file, int parameter_count,
             int actual_argument_count);
@@ -418,11 +424,11 @@ class TranslatedState {
   enum Purpose { kDeoptimization, kFrameInspection };
 
   TranslatedFrame CreateNextTranslatedFrame(
-      DeoptimizationFrameTranslation::Iterator* iterator,
+      DeoptTranslationIterator* iterator,
       Tagged<DeoptimizationLiteralArray> literal_array, Address fp,
       FILE* trace_file);
   int CreateNextTranslatedValue(
-      int frame_index, DeoptimizationFrameTranslation::Iterator* iterator,
+      int frame_index, DeoptTranslationIterator* iterator,
       Tagged<DeoptimizationLiteralArray> literal_array, Address fp,
       RegisterValues* registers, FILE* trace_file);
   Address DecompressIfNeeded(intptr_t value);
@@ -459,7 +465,7 @@ class TranslatedState {
       TranslatedFrame* frame, int* value_index, TranslatedValue* slot,
       Handle<Map> map, const DisallowGarbageCollection& no_gc);
 
-  void ReadUpdateFeedback(DeoptimizationFrameTranslation::Iterator* iterator,
+  void ReadUpdateFeedback(DeoptTranslationIterator* iterator,
                           Tagged<DeoptimizationLiteralArray> literal_array,
                           FILE* trace_file);
 

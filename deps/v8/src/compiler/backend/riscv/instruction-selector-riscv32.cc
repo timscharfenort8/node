@@ -277,6 +277,7 @@ void InstructionSelectorT<Adapter>::VisitLoad(node_t node) {
     case MachineRepresentation::kWord64:
     case MachineRepresentation::kNone:
     case MachineRepresentation::kSimd256:  // Fall through.
+    case MachineRepresentation::kProtectedPointer:  // Fall through.
     case MachineRepresentation::kIndirectPointer:
       UNREACHABLE();
     }
@@ -337,6 +338,7 @@ void InstructionSelectorT<TurboshaftAdapter>::VisitStore(node_t node) {
       case MachineRepresentation::kNone:
       case MachineRepresentation::kWord64:
       case MachineRepresentation::kSimd256:  // Fall through.
+      case MachineRepresentation::kProtectedPointer:  // Fall through.
       case MachineRepresentation::kIndirectPointer:
         UNREACHABLE();
     }
@@ -443,6 +445,7 @@ void InstructionSelectorT<TurbofanAdapter>::VisitStore(Node* node) {
       case MachineRepresentation::kNone:
       case MachineRepresentation::kWord64:
       case MachineRepresentation::kSimd256:  // Fall through.
+      case MachineRepresentation::kProtectedPointer:  // Fall through.
       case MachineRepresentation::kIndirectPointer:
         UNREACHABLE();
     }
@@ -547,13 +550,13 @@ void InstructionSelectorT<Adapter>::VisitWord32ReverseBytes(node_t node) {
     UNIMPLEMENTED();
   } else {
     RiscvOperandGeneratorT<Adapter> g(this);
-#ifdef CAN_USE_ZBB_INSTRUCTIONS
-    Emit(kRiscvRev8, g.DefineAsRegister(node),
-         g.UseRegister(this->input_at(node, 0)));
-#else
-    Emit(kRiscvByteSwap32, g.DefineAsRegister(node),
-         g.UseRegister(node->InputAt(0)));
-#endif
+    if (CpuFeatures::IsSupported(ZBB)) {
+      Emit(kRiscvRev8, g.DefineAsRegister(node),
+           g.UseRegister(this->input_at(node, 0)));
+    } else {
+      Emit(kRiscvByteSwap32, g.DefineAsRegister(node),
+           g.UseRegister(node->InputAt(0)));
+    }
   }
 }
 
@@ -976,6 +979,7 @@ void InstructionSelectorT<Adapter>::VisitUnalignedLoad(node_t node) {
       case MachineRepresentation::kCompressed:         // Fall through.
       case MachineRepresentation::kSandboxedPointer:   // Fall through.
       case MachineRepresentation::kMapWord:            // Fall through.
+      case MachineRepresentation::kProtectedPointer:   // Fall through.
       case MachineRepresentation::kWord64:
       case MachineRepresentation::kNone:
       case MachineRepresentation::kIndirectPointer:
@@ -1038,6 +1042,7 @@ void InstructionSelectorT<Adapter>::VisitUnalignedStore(node_t node) {
       case MachineRepresentation::kCompressed:         // Fall through.
       case MachineRepresentation::kSandboxedPointer:
       case MachineRepresentation::kMapWord:  // Fall through.
+      case MachineRepresentation::kProtectedPointer:  // Fall through.
       case MachineRepresentation::kNone:
       case MachineRepresentation::kWord64:
       case MachineRepresentation::kIndirectPointer:
@@ -1709,12 +1714,6 @@ void InstructionSelectorT<Adapter>::VisitInt32AbsWithOverflow(node_t node) {
 template <typename Adapter>
 void InstructionSelectorT<Adapter>::VisitInt64AbsWithOverflow(node_t node) {
   UNREACHABLE();
-}
-
-template <typename Adapter>
-void InstructionSelectorT<Adapter>::VisitBitcastWord32PairToFloat64(
-    node_t node) {
-  UNIMPLEMENTED();
 }
 
 template <unsigned N, typename Adapter>

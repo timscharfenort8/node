@@ -46,13 +46,14 @@ extern runtime WasmArrayCopy(Context, WasmArray, Smi, WasmArray, Smi, Smi):
 extern runtime WasmArrayNewSegment(
     Context, WasmTrustedInstanceData, Smi, Smi, Smi, Map): Object;
 extern runtime WasmStringNewSegmentWtf8(
-    Context, WasmTrustedInstanceData, Smi, Smi, Smi, Smi): String;
+    Context, WasmTrustedInstanceData, Smi, Smi, Smi, Smi): String|WasmNull;
 extern runtime WasmArrayInitSegment(
     Context, WasmTrustedInstanceData, Smi, WasmArray, Smi, Smi, Smi): JSAny;
 extern runtime WasmStringNewWtf8(
-    Context, WasmTrustedInstanceData, Smi, Smi, Number, Number): String|Null;
+    Context, WasmTrustedInstanceData, Smi, Smi, Number, Number): String
+    |WasmNull;
 extern runtime WasmStringNewWtf8Array(Context, Smi, WasmArray, Smi, Smi): String
-    |Null;
+    |WasmNull;
 extern runtime WasmStringNewWtf16(
     Context, WasmTrustedInstanceData, Smi, Number, Number): String;
 extern runtime WasmStringNewWtf16Array(Context, WasmArray, Smi, Smi): String;
@@ -68,14 +69,16 @@ extern runtime WasmStringEncodeWtf16(
     Context, WasmTrustedInstanceData, Smi, String, Number, Smi, Smi): JSAny;
 extern runtime WasmStringAsWtf8(Context, String): ByteArray;
 extern runtime WasmStringViewWtf8Encode(
-    Context, WasmTrustedInstanceData, Smi, ByteArray, Number, Number,
-    Number): JSAny;
+    Context, WasmTrustedInstanceData, Smi, ByteArray, Number, Number, Number,
+    Smi): JSAny;
 extern runtime WasmStringViewWtf8Slice(Context, ByteArray, Number, Number):
     String;
 extern runtime WasmStringFromCodePoint(Context, Number): String;
 extern runtime WasmStringHash(NoContext, String): Smi;
 extern runtime WasmSubstring(Context, String, Smi, Smi): String;
 extern runtime WasmJSToWasmObject(Context, JSAny, Smi): JSAny;
+
+extern runtime PropagateException(NoContext): JSAny;
 }
 
 namespace unsafe {
@@ -106,6 +109,8 @@ extern macro WasmBuiltinsAssembler::LoadInstanceDataFromFrame():
 // TODO(bbudge) Eliminate these functions when Torque is ready.
 extern macro WasmBuiltinsAssembler::LoadContextFromInstanceData(
     WasmTrustedInstanceData): NativeContext;
+extern macro WasmBuiltinsAssembler::LoadSharedPartFromInstanceData(
+    WasmTrustedInstanceData): WasmTrustedInstanceData;
 extern macro WasmBuiltinsAssembler::LoadTablesFromInstanceData(
     WasmTrustedInstanceData): FixedArray;
 extern macro WasmBuiltinsAssembler::LoadFuncRefsFromInstanceData(
@@ -309,10 +314,10 @@ builtin WasmFunctionTableGet(tableIndex: intptr, index: int32): Object {
       SmiFromIntPtr(tableIndex), SmiFromInt32(index));
 }
 
-builtin WasmTableSetFuncRef(
-    tableIndex: intptr, index: uint32, value: WasmFuncRef): Object {
+builtin WasmTableSetFuncRefImpl(
+    trustedData: WasmTrustedInstanceData, tableIndex: intptr, index: uint32,
+    value: WasmFuncRef): Object {
   dcheck(Is<WasmFuncRef>(value) || Is<WasmNull>(value));
-  const trustedData: WasmTrustedInstanceData = LoadInstanceDataFromFrame();
   const entryIndex: intptr = Signed(ChangeUint32ToWord(index));
   try {
     dcheck(IsValidPositiveSmi(tableIndex));
@@ -330,6 +335,20 @@ builtin WasmTableSetFuncRef(
   } label IndexOutOfRange deferred {
     tail ThrowWasmTrapTableOutOfBounds();
   }
+}
+
+builtin WasmTableSetFuncRef(
+    tableIndex: intptr, index: uint32, value: WasmFuncRef): Object {
+  const trustedData: WasmTrustedInstanceData = LoadInstanceDataFromFrame();
+  tail WasmTableSetFuncRefImpl(trustedData, tableIndex, index, value);
+}
+
+builtin WasmSharedTableSetFuncRefFromUnshared(
+    tableIndex: intptr, index: uint32, value: WasmFuncRef): Object {
+  const trustedData: WasmTrustedInstanceData = LoadInstanceDataFromFrame();
+  const sharedTrustedData: WasmTrustedInstanceData =
+      LoadSharedPartFromInstanceData(trustedData);
+  tail WasmTableSetFuncRefImpl(sharedTrustedData, tableIndex, index, value);
 }
 
 builtin WasmRefFunc(index: uint32): Object {
@@ -536,6 +555,15 @@ builtin UintPtr53ToNumber(value: uintptr): Number {
   return AllocateHeapNumberWithValue(valueFloat);
 }
 
+// Suitable for indexes/offsets into memory: while values >2^53 will get
+// rounded off, they're all OOB anyway, and an OOB check after a conversion
+// back to uintptr can still detect that. (Alternatively we could trap
+// right here.)
+macro UintPtrToNumberRounding(value: uintptr): Number {
+  if (value <= kSmiMaxValue) return Convert<Smi>(Convert<intptr>(value));
+  return AllocateHeapNumberWithValue(ChangeUintPtrToFloat64(value));
+}
+
 extern builtin I64ToBigInt(intptr): BigInt;
 extern builtin I32PairToBigInt(/*low*/ intptr, /*high*/ intptr): BigInt;
 
@@ -563,9 +591,6 @@ builtin WasmI64AtomicWait(
 
 // Type feedback collection support for `call_ref`.
 
-extern macro LoadWasmInternalFunctionInstructionStart(WasmInternalFunction):
-    RawPtr;
-
 // Vector format:
 // Two slots per call_ref instruction. These slots' values can be:
 // - uninitialized: (0, <unused>). Note: we use {0} as the sentinel because
@@ -578,8 +603,8 @@ extern macro LoadWasmInternalFunctionInstructionStart(WasmInternalFunction):
 //
 // TODO(rstz): The counter might overflow if it exceeds the range of a Smi.
 // This can lead to incorrect inlining decisions.
-macro UpdateIC(vector: FixedArray, index: intptr, funcref: WasmFuncRef):
-    void {
+macro UpdateCallRefIC(
+    vector: FixedArray, index: intptr, funcref: WasmFuncRef): void {
   const value = vector.objects[index];
   if (value == funcref) {
     // Monomorphic hit. Check for this case first to maximize its performance.
@@ -648,17 +673,13 @@ struct TargetAndRef {
   ref: WasmTrustedInstanceData|WasmApiFunctionRef;
 }
 
-builtin CallRefIC(vector: FixedArray, index: intptr, funcref: WasmFuncRef):
+builtin CallRefIC(vector: FixedArray, index: int32, funcref: WasmFuncRef):
     TargetAndRef {
   dcheck(Is<WasmFuncRef>(funcref));
-  UpdateIC(vector, index, funcref);
+  UpdateCallRefIC(vector, Convert<intptr>(index), funcref);
 
   const internal = funcref.internal;
-  let target = internal.call_target_ptr;
-  if (Signed(target) == IntPtrConstant(0)) {
-    target = LoadWasmInternalFunctionInstructionStart(internal);
-  }
-  return TargetAndRef{target: target, ref: internal.ref};
+  return TargetAndRef{target: internal.call_target, ref: internal.ref};
 }
 
 extern macro TryHasOwnProperty(HeapObject, Map, InstanceType, Name): never
@@ -702,6 +723,10 @@ builtin ThrowWasmTrapUnreachable(): JSAny {
 
 builtin WasmTrapHandlerThrowTrap(): JSAny {
   tail runtime::TrapHandlerThrowWasmError(LoadContextFromWasmOrJsFrame());
+}
+
+builtin WasmPropagateException(): JSAny {
+  tail runtime::PropagateException(kNoContext);
 }
 
 builtin ThrowWasmTrapMemOutOfBounds(): JSAny {
@@ -790,15 +815,17 @@ macro ModifyThreadInWasmFlag(newValue: int32): void {
 }
 
 builtin WasmStringNewWtf8(
-    offset: uint32, size: uint32, memory: Smi, utf8Variant: Smi): String|Null {
+    offset: uintptr, size: uint32, memory: uint32, utf8Variant: Smi): String
+    |WasmNull {
   const trustedData = LoadInstanceDataFromFrame();
   tail runtime::WasmStringNewWtf8(
-      LoadContextFromInstanceData(trustedData), trustedData, memory,
-      utf8Variant, WasmUint32ToNumber(offset), WasmUint32ToNumber(size));
+      LoadContextFromInstanceData(trustedData), trustedData,
+      SmiFromUint32(memory), utf8Variant, UintPtrToNumberRounding(offset),
+      WasmUint32ToNumber(size));
 }
 builtin WasmStringNewWtf8Array(
     start: uint32, end: uint32, array: WasmArray, utf8Variant: Smi): String
-    |Null {
+    |WasmNull {
   // This can be called from Wasm and from "JS String Builtins".
   const context = LoadContextFromWasmOrJsFrame();
   try {
@@ -811,12 +838,12 @@ builtin WasmStringNewWtf8Array(
     runtime::ThrowWasmError(context, SmiConstant(error));
   }
 }
-builtin WasmStringNewWtf16(memory: uint32, offset: uint32, size: uint32):
+builtin WasmStringNewWtf16(memory: uint32, offset: uintptr, size: uint32):
     String {
   const trustedData = LoadInstanceDataFromFrame();
   tail runtime::WasmStringNewWtf16(
       LoadContextFromInstanceData(trustedData), trustedData,
-      SmiFromUint32(memory), WasmUint32ToNumber(offset),
+      SmiFromUint32(memory), UintPtrToNumberRounding(offset),
       WasmUint32ToNumber(size));
 }
 
@@ -939,11 +966,11 @@ builtin WasmStringNewWtf16Array(array: WasmArray, start: uint32, end: uint32):
 }
 
 // For imports based string constants.
-// Always returns a String if it didn't trap; typed "JSAny" to satisfy
-// Torque's type checker for tail calls.
+// Always returns a String or WasmNull if it didn't trap; typed "JSAny" to
+// satisfy Torque's type checker for tail calls.
 builtin WasmStringFromDataSegment(
     segmentLength: uint32, arrayStart: uint32, arrayEnd: uint32,
-    segmentIndex: Smi, segmentOffset: Smi, variant: Smi): JSAny {
+    segmentIndex: Smi, segmentOffset: Smi, variant: Smi): JSAny|WasmNull {
   const trustedData = LoadInstanceDataFromFrame();
   try {
     const segmentOffsetU: uint32 = Unsigned(SmiToInt32(segmentOffset));
@@ -989,11 +1016,13 @@ builtin WasmStringMeasureWtf8(string: String): int32 {
   return NumberToInt32(result);
 }
 builtin WasmStringEncodeWtf8(
-    string: String, offset: uint32, memory: Smi, utf8Variant: Smi): uint32 {
+    offset: uintptr, memory: uint32, utf8Variant: uint32,
+    string: String): uint32 {
   const trustedData = LoadInstanceDataFromFrame();
   const result = runtime::WasmStringEncodeWtf8(
-      LoadContextFromInstanceData(trustedData), trustedData, memory,
-      utf8Variant, string, WasmUint32ToNumber(offset));
+      LoadContextFromInstanceData(trustedData), trustedData,
+      SmiFromUint32(memory), SmiFromUint32(utf8Variant), string,
+      UintPtrToNumberRounding(offset));
   return NumberToUint32(result);
 }
 builtin WasmStringEncodeWtf8Array(
@@ -1007,12 +1036,13 @@ builtin WasmStringEncodeWtf8Array(
 builtin WasmStringToUtf8Array(string: String): WasmArray {
   return runtime::WasmStringToUtf8Array(LoadContextFromFrame(), string);
 }
-builtin WasmStringEncodeWtf16(string: String, offset: uint32, memory: Smi):
+builtin WasmStringEncodeWtf16(string: String, offset: uintptr, memory: uint32):
     uint32 {
   const trustedData = LoadInstanceDataFromFrame();
   runtime::WasmStringEncodeWtf16(
-      LoadContextFromInstanceData(trustedData), trustedData, memory, string,
-      WasmUint32ToNumber(offset), SmiConstant(0), SmiFromInt32(string.length));
+      LoadContextFromInstanceData(trustedData), trustedData,
+      SmiFromUint32(memory), string, UintPtrToNumberRounding(offset),
+      SmiConstant(0), SmiFromInt32(string.length));
   return Unsigned(string.length);
 }
 builtin WasmStringEncodeWtf16Array(
@@ -1148,31 +1178,25 @@ builtin WasmStringViewWtf8Advance(view: ByteArray, pos: uint32, bytes: uint32):
   return AlignWtf8PositionBackward(view, clampedPos + bytes);
 }
 struct NewPositionAndBytesWritten {
-  newPosition: uintptr;
-  bytesWritten: uintptr;
+  newPosition: uint32;
+  bytesWritten: uint32;
 }
 builtin WasmStringViewWtf8Encode(
-    addr: uint32, pos: uint32, bytes: uint32, view: ByteArray, memory: Smi,
+    addr: uintptr, pos: uint32, bytes: uint32, view: ByteArray, memory: Smi,
     utf8Variant: Smi): NewPositionAndBytesWritten {
   const start = WasmStringViewWtf8Advance(view, pos, 0);
   const end = WasmStringViewWtf8Advance(view, start, bytes);
   const trustedData = LoadInstanceDataFromFrame();
   const context = LoadContextFromInstanceData(trustedData);
 
-  // kMaxArgs in code-assembler.cc:CallRunTimeImpl is currently limited
-  // to 6 arguments when calling a runtime function.  Throw away the
-  // memory argument for now; when we need multi-memory we can bump
-  // kMaxArgs.
-  dcheck(memory == SmiFromInt32(0));
-
   // Always call out to run-time, to catch invalid addr.
   runtime::WasmStringViewWtf8Encode(
-      context, trustedData, utf8Variant, view, WasmUint32ToNumber(addr),
-      WasmUint32ToNumber(start), WasmUint32ToNumber(end));
+      context, trustedData, utf8Variant, view, UintPtrToNumberRounding(addr),
+      WasmUint32ToNumber(start), WasmUint32ToNumber(end), memory);
 
   return NewPositionAndBytesWritten{
-    newPosition: Convert<uintptr>(end),
-    bytesWritten: Convert<uintptr>(end - start)
+    newPosition: end,
+    bytesWritten: end - start
   };
 }
 builtin WasmStringViewWtf8Slice(view: ByteArray, start: uint32, end: uint32):
@@ -1198,7 +1222,7 @@ transitioning builtin WasmStringViewWtf16GetCodeUnit(
   }
 }
 builtin WasmStringViewWtf16Encode(
-    offset: uint32, start: uint32, length: uint32, string: String,
+    offset: uintptr, start: uint32, length: uint32, string: String,
     memory: Smi): uint32 {
   const trustedData = LoadInstanceDataFromFrame();
   const clampedStart =
@@ -1207,7 +1231,7 @@ builtin WasmStringViewWtf16Encode(
   const clampedLength = length < maxLength ? length : maxLength;
   runtime::WasmStringEncodeWtf16(
       LoadContextFromInstanceData(trustedData), trustedData, memory, string,
-      WasmUint32ToNumber(offset), SmiFromUint32(clampedStart),
+      UintPtrToNumberRounding(offset), SmiFromUint32(clampedStart),
       SmiFromUint32(clampedLength));
   return clampedLength;
 }

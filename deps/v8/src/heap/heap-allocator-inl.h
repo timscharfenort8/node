@@ -118,12 +118,13 @@ V8_WARN_UNUSED_RESULT V8_INLINE AllocationResult HeapAllocator::AllocateRaw(
         case AllocationType::kOld:
           allocation = old_space_allocator_->AllocateRaw(size_in_bytes,
                                                          alignment, origin);
+          DCHECK_IMPLIES(
+              v8_flags.sticky_mark_bits && !allocation.IsFailure(),
+              heap_->marking_state()->IsMarked(allocation.ToObject()));
           break;
         case AllocationType::kCode: {
           DCHECK_EQ(alignment, AllocationAlignment::kTaggedAligned);
           DCHECK(AllowCodeAllocation::IsAllowed());
-          CodePageHeaderModificationScope header_modification_scope(
-              "Code allocation needs header access.");
           allocation = code_space_allocator_->AllocateRaw(
               size_in_bytes, AllocationAlignment::kTaggedAligned, origin);
           break;

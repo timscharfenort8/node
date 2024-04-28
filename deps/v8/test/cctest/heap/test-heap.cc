@@ -50,6 +50,7 @@
 #include "src/heap/heap-verifier.h"
 #include "src/heap/heap.h"
 #include "src/heap/incremental-marking.h"
+#include "src/heap/large-page-inl.h"
 #include "src/heap/large-spaces.h"
 #include "src/heap/mark-compact-inl.h"
 #include "src/heap/mark-compact.h"
@@ -624,7 +625,7 @@ TEST(BytecodeArray) {
   static const uint8_t kRawBytes[] = {0xC3, 0x7E, 0xA5, 0x5A};
   static const int kRawBytesSize = sizeof(kRawBytes);
   static const int32_t kFrameSize = 32;
-  static const int32_t kParameterCount = 2;
+  static const uint16_t kParameterCount = 2;
 
   ManualGCScope manual_gc_scope;
   heap::ManualEvacuationCandidatesSelectionScope
@@ -6978,6 +6979,7 @@ void HeapTester::UncommitUnusedMemory(Heap* heap) {
 
 class DeleteNative {
  public:
+  static constexpr ExternalPointerTag kManagedTag = kGenericManagedTag;
   static void Deleter(void* arg) {
     delete reinterpret_cast<DeleteNative*>(arg);
   }

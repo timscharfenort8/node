@@ -127,6 +127,7 @@ class SharedLargeObjectSpace;
 class SharedReadOnlySpace;
 class SharedSpace;
 class Space;
+class StickySpace;
 class StressScavengeObserver;
 class TimedHistogram;
 class TrustedLargeObjectSpace;
@@ -762,6 +763,7 @@ class Heap final {
   inline PagedNewSpace* paged_new_space() const;
   inline SemiSpaceNewSpace* semi_space_new_space() const;
   OldSpace* old_space() const { return old_space_; }
+  inline StickySpace* sticky_space() const;
   CodeSpace* code_space() const { return code_space_; }
   SharedSpace* shared_space() const { return shared_space_; }
   OldLargeObjectSpace* lo_space() const { return lo_space_; }
@@ -791,6 +793,9 @@ class Heap final {
   ExternalPointerTable::Space* read_only_external_pointer_space() {
     return &read_only_external_pointer_space_;
   }
+  ExternalPointerTable::Space* cpp_heap_pointer_space() {
+    return &cpp_heap_pointer_space_;
+  }
 #endif  // V8_COMPRESS_POINTERS
 
 #ifdef V8_ENABLE_SANDBOX
@@ -799,6 +804,10 @@ class Heap final {
   }
 
   CodePointerTable::Space* code_pointer_space() { return &code_pointer_space_; }
+
+  ExternalBufferTable::Space* external_buffer_space() {
+    return &external_buffer_space_;
+  }
 #endif  // V8_ENABLE_SANDBOX
 
   // ===========================================================================
@@ -1110,7 +1119,8 @@ class Heap final {
 
   std::optional<StackState> overridden_stack_state() const;
 
-  V8_EXPORT_PRIVATE void SetStackStart(void* stack_start);
+  // Set stack information from the stack of the current thread.
+  V8_EXPORT_PRIVATE void SetStackStart();
 
   // Stack information of the main thread.
   V8_EXPORT_PRIVATE ::heap::base::Stack& stack();
@@ -1592,6 +1602,9 @@ class Heap final {
   // over all objects.
   V8_EXPORT_PRIVATE void MakeHeapIterable();
 
+  V8_EXPORT_PRIVATE void Unmark();
+  V8_EXPORT_PRIVATE void DeactivateMajorGCInProgressFlag();
+
   // Free all LABs in the heap.
   V8_EXPORT_PRIVATE void FreeLinearAllocationAreas();
 
@@ -1947,8 +1960,8 @@ class Heap final {
 
   HeapGrowingMode CurrentHeapGrowingMode();
 
-  double PercentToOldGenerationLimit();
-  double PercentToGlobalMemoryLimit();
+  double PercentToOldGenerationLimit() const;
+  double PercentToGlobalMemoryLimit() const;
   enum class IncrementalMarkingLimit {
     kNoLimit,
     kSoftLimit,
@@ -2150,6 +2163,9 @@ class Heap final {
   ExternalPointerTable::Space external_pointer_space_;
   // Likewise but for slots in host objects in ReadOnlySpace.
   ExternalPointerTable::Space read_only_external_pointer_space_;
+  // Space in the ExternalPointerTable containing entries owned by objects in
+  // this heap. The entries exclusively point to CppHeap objects.
+  ExternalPointerTable::Space cpp_heap_pointer_space_;
 #endif  // V8_COMPRESS_POINTERS
 
 #ifdef V8_ENABLE_SANDBOX
@@ -2158,6 +2174,10 @@ class Heap final {
 
   // The space in the process-wide code pointer table managed by this heap.
   CodePointerTable::Space code_pointer_space_;
+
+  // The space in the ExternalBufferTable containing entries owned by objects
+  // in this heap.
+  ExternalBufferTable::Space external_buffer_space_;
 #endif  // V8_ENABLE_SANDBOX
 
   LocalHeap* main_thread_local_heap_ = nullptr;
@@ -2393,6 +2413,7 @@ class Heap final {
   friend class ArrayBufferSweeper;
   friend class ConcurrentMarking;
   friend class ConservativeTracedHandlesMarkingVisitor;
+  friend class CppHeap;
   friend class EmbedderStackStateScope;
   friend class EvacuateVisitorBase;
   friend class GCCallbacksScope;
@@ -2537,28 +2558,6 @@ class V8_NODISCARD AlwaysAllocateScopeForTesting {
   AlwaysAllocateScope scope_;
 };
 
-// The CodePageHeaderModificationScope enables write access to Code
-// space page headers. On most of the configurations it's a no-op because
-// Code space page headers are configured as writable and
-// permissions are never changed. However, on MacOS on ARM64 ("Apple M1"/Apple
-// Silicon) the situation is different. In order to be able to use fast W^X
-// permissions switching machinery (APRR/MAP_JIT) it's necessary to configure
-// executable memory as readable writable executable (RWX). Also, on MacOS on
-// ARM64 reconfiguration of RWX page permissions to anything else is prohibited.
-// So, in order to be able to allocate large code pages over freed regular
-// code pages and vice versa we have to allocate Code page headers
-// as RWX too and switch them to writable mode when it's necessary to modify the
-// code page header. The scope can be used from any thread and affects only
-// current thread, see RwxMemoryWriteScope for details about semantics of the
-// scope.
-#if V8_HEAP_USE_PTHREAD_JIT_WRITE_PROTECT
-using CodePageHeaderModificationScope = RwxMemoryWriteScope;
-#else
-// When write protection of code page headers is not required the scope is
-// a no-op.
-using CodePageHeaderModificationScope = NopRwxMemoryWriteScope;
-#endif  // V8_HEAP_USE_PTHREAD_JIT_WRITE_PROTECT
-
 class CodePageMemoryModificationScopeForDebugging {
  public:
   // When we zap newly allocated MemoryChunks, the chunk is not initialized yet
@@ -2571,7 +2570,8 @@ class CodePageMemoryModificationScopeForDebugging {
   ~CodePageMemoryModificationScopeForDebugging();
 
  private:
-#if V8_HEAP_USE_PTHREAD_JIT_WRITE_PROTECT || V8_HEAP_USE_PKU_JIT_WRITE_PROTECT
+#if V8_HEAP_USE_PTHREAD_JIT_WRITE_PROTECT || \
+    V8_HEAP_USE_PKU_JIT_WRITE_PROTECT || V8_HEAP_USE_BECORE_JIT_WRITE_PROTECT
   RwxMemoryWriteScope rwx_write_scope_;
 #endif
 };
@@ -2677,8 +2677,10 @@ class StrongRootAllocator<Address> : public StrongRootAllocatorBase {
   using value_type = Address;
 
   explicit StrongRootAllocator(Heap* heap) : StrongRootAllocatorBase(heap) {}
-  explicit StrongRootAllocator(v8::Isolate* isolate)
+  explicit StrongRootAllocator(Isolate* isolate)
       : StrongRootAllocatorBase(isolate) {}
+  explicit StrongRootAllocator(v8::Isolate* isolate)
+      : StrongRootAllocatorBase(reinterpret_cast<Isolate*>(isolate)) {}
   template <typename U>
   StrongRootAllocator(const StrongRootAllocator<U>& other) V8_NOEXCEPT
       : StrongRootAllocatorBase(other) {}

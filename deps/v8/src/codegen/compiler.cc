@@ -80,7 +80,8 @@ constexpr bool IsOSR(BytecodeOffset osr_offset) { return !osr_offset.IsNone(); }
 void SetTieringState(IsolateForSandbox isolate, Tagged<JSFunction> function,
                      BytecodeOffset osr_offset, TieringState value) {
   if (IsOSR(osr_offset)) {
-    function->set_osr_tiering_state(value);
+    DCHECK(value == TieringState::kInProgress || value == TieringState::kNone);
+    function->set_osr_tiering_in_progress(IsInProgress(value));
   } else {
     function->set_tiering_state(isolate, value);
   }
@@ -1361,7 +1362,7 @@ MaybeHandle<Code> GetOrCompileOptimized(
   if (OptimizedCodeCache::Get(isolate, function, osr_offset, code_kind)
           .ToHandle(&cached_code)) {
     if (IsOSR(osr_offset)) {
-      if (!IsInProgress(function->osr_tiering_state())) {
+      if (!function->osr_tiering_in_progress()) {
         function->feedback_vector()->reset_osr_urgency();
       }
     } else {
@@ -1372,7 +1373,7 @@ MaybeHandle<Code> GetOrCompileOptimized(
 
   if (IsOSR(osr_offset)) {
     // One OSR job per function at a time.
-    if (IsInProgress(function->osr_tiering_state())) {
+    if (function->osr_tiering_in_progress()) {
       return {};
     }
 
@@ -3218,7 +3219,6 @@ struct ScriptCompileTimerScope {
         all_scripts_histogram_scope_(isolate->counters()->compile_script()),
         no_cache_reason_(no_cache_reason),
         hit_isolate_cache_(false),
-        producing_code_cache_(false),
         consuming_code_cache_(false),
         consuming_code_cache_failed_(false) {}
 
@@ -3241,8 +3241,6 @@ struct ScriptCompileTimerScope {
 
   void set_hit_isolate_cache() { hit_isolate_cache_ = true; }
 
-  void set_producing_code_cache() { producing_code_cache_ = true; }
-
   void set_consuming_code_cache() { consuming_code_cache_ = true; }
 
   void set_consuming_code_cache_failed() {
@@ -3257,19 +3255,10 @@ struct ScriptCompileTimerScope {
   NestedTimedHistogramScope all_scripts_histogram_scope_;
   ScriptCompiler::NoCacheReason no_cache_reason_;
   bool hit_isolate_cache_;
-  bool producing_code_cache_;
   bool consuming_code_cache_;
   bool consuming_code_cache_failed_;
 
   CacheBehaviour GetCacheBehaviour() {
-    if (producing_code_cache_) {
-      if (hit_isolate_cache_) {
-        return CacheBehaviour::kHitIsolateCacheWhenProduceCodeCache;
-      } else {
-        return CacheBehaviour::kProduceCodeCache;
-      }
-    }
-
     if (consuming_code_cache_) {
       if (hit_isolate_cache_) {
         return CacheBehaviour::kHitIsolateCacheWhenConsumeCodeCache;
@@ -3280,7 +3269,15 @@ struct ScriptCompileTimerScope {
     }
 
     if (hit_isolate_cache_) {
-      if (no_cache_reason_ == ScriptCompiler::kNoCacheBecauseStreamingSource) {
+      // A roundabout way of knowing the embedder is going to produce a code
+      // cache (which is done by a separate API call later) is to check whether
+      // no_cache_reason_ is
+      // ScriptCompiler::kNoCacheBecauseDeferredProduceCodeCache.
+      if (no_cache_reason_ ==
+          ScriptCompiler::kNoCacheBecauseDeferredProduceCodeCache) {
+        return CacheBehaviour::kHitIsolateCacheWhenProduceCodeCache;
+      } else if (no_cache_reason_ ==
+                 ScriptCompiler::kNoCacheBecauseStreamingSource) {
         return CacheBehaviour::kHitIsolateCacheWhenStreamingSource;
       }
       return CacheBehaviour::kHitIsolateCacheWhenNoCache;
@@ -3315,14 +3312,9 @@ struct ScriptCompileTimerScope {
         return CacheBehaviour::kNoCacheBecauseInDocumentWrite;
       case ScriptCompiler::kNoCacheBecauseResourceWithNoCacheHandler:
         return CacheBehaviour::kNoCacheBecauseResourceWithNoCacheHandler;
-      case ScriptCompiler::kNoCacheBecauseDeferredProduceCodeCache: {
-        if (hit_isolate_cache_) {
-          return CacheBehaviour::kHitIsolateCacheWhenProduceCodeCache;
-        } else {
-          return CacheBehaviour::kProduceCodeCache;
-        }
+      case ScriptCompiler::kNoCacheBecauseDeferredProduceCodeCache:
+        return CacheBehaviour::kProduceCodeCache;
       }
-    }
     UNREACHABLE();
   }
 

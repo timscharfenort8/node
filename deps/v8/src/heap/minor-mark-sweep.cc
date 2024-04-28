@@ -164,9 +164,6 @@ YoungGenerationRememberedSetsMarkingWorklist::CollectItems(Heap* heap) {
   std::vector<MarkingItem> items;
   int max_remembered_set_count = EstimateMaxNumberOfRemeberedSets(heap);
   items.reserve(max_remembered_set_count);
-  CodePageHeaderModificationScope rwx_write_scope(
-      "Extracting of slot sets requires write access to Code page "
-      "header");
   OldGenerationMemoryChunkIterator::ForAll(
       heap, [&items](MutablePageMetadata* chunk) {
         SlotSet* slot_set = chunk->ExtractSlotSet<OLD_TO_NEW>();
@@ -229,9 +226,6 @@ YoungGenerationRememberedSetsMarkingWorklist::
 
 YoungGenerationRememberedSetsMarkingWorklist::
     ~YoungGenerationRememberedSetsMarkingWorklist() {
-  CodePageHeaderModificationScope rwx_write_scope(
-      "Merging slot sets back to pages requires write access to Code page "
-      "header");
   for (MarkingItem item : remembered_sets_marking_items_) {
     item.MergeAndDeleteRememberedSets();
   }
@@ -293,6 +287,8 @@ void MinorMarkSweepCollector::FinishConcurrentMarking() {
     heap_->concurrent_marking()->FlushPretenuringFeedback();
   }
   CHECK(heap_->concurrent_marking()->IsStopped());
+  heap_->tracer()->SampleConcurrencyEsimate(
+      heap_->concurrent_marking()->FetchAndResetConcurrencyEstimate());
   if (auto* cpp_heap = CppHeap::From(heap_->cpp_heap_)) {
     cpp_heap->FinishConcurrentMarkingIfNeeded();
   }
@@ -806,7 +802,7 @@ bool ShouldMovePage(PageMetadata* p, intptr_t live_bytes,
     // Don't allocate on old pages so that recently allocated objects on the
     // page get a chance to die young. The page will be force promoted on the
     // next GC because `AllocatedLabSize` will be 0.
-    p->Chunk()->SetFlag(MemoryChunk::NEVER_ALLOCATE_ON_PAGE);
+    p->Chunk()->SetFlagNonExecutable(MemoryChunk::NEVER_ALLOCATE_ON_PAGE);
   }
   return should_move_page;
 }
@@ -883,8 +879,8 @@ bool MinorMarkSweepCollector::SweepNewLargeSpace() {
                                       current);
       continue;
     }
-    chunk->ClearFlag(MemoryChunk::TO_PAGE);
-    chunk->SetFlag(MemoryChunk::FROM_PAGE);
+    chunk->ClearFlagNonExecutable(MemoryChunk::TO_PAGE);
+    chunk->SetFlagNonExecutable(MemoryChunk::FROM_PAGE);
     current->ProgressBar().ResetIfEnabled();
     old_lo_space->PromoteNewLargeObject(current);
     has_promoted_pages = true;

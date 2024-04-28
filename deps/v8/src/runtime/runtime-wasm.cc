@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include "src/builtins/builtins-inl.h"
 #include "src/builtins/data-view-ops.h"
 #include "src/common/assert-scope.h"
 #include "src/common/message-template.h"
@@ -136,7 +137,7 @@ RUNTIME_FUNCTION(Runtime_WasmGenericWasmToJSObject) {
   Tagged<Object> value = args[0];
   if (IsWasmFuncRef(value)) {
     Tagged<WasmInternalFunction> internal =
-        WasmFuncRef::cast(value)->internal();
+        WasmFuncRef::cast(value)->internal(isolate);
     Tagged<JSFunction> external;
     if (internal->try_get_external(&external)) return external;
     // Slow path:
@@ -354,12 +355,18 @@ RUNTIME_FUNCTION(Runtime_WasmThrow) {
   ClearThreadInWasmScope clear_wasm_flag(isolate);
   HandleScope scope(isolate);
   DCHECK_EQ(2, args.length());
-  isolate->set_context(GetNativeContextFromWasmInstanceOnStackTop(isolate));
+  Tagged<Context> context = GetNativeContextFromWasmInstanceOnStackTop(isolate);
+  isolate->set_context(context);
   Handle<WasmExceptionTag> tag(WasmExceptionTag::cast(args[0]), isolate);
   Handle<FixedArray> values(FixedArray::cast(args[1]), isolate);
-  Handle<WasmExceptionPackage> exception =
-      WasmExceptionPackage::New(isolate, tag, values);
-  return isolate->Throw(*exception);
+  auto js_tag = WasmTagObject::cast(context->wasm_js_tag());
+  if (*tag == js_tag->tag()) {
+    return isolate->Throw(values->get(0));
+  } else {
+    Handle<WasmExceptionPackage> exception =
+        WasmExceptionPackage::New(isolate, tag, values);
+    return isolate->Throw(*exception);
+  }
 }
 
 RUNTIME_FUNCTION(Runtime_WasmReThrow) {
@@ -451,7 +458,7 @@ void ReplaceWrapper(Isolate* isolate,
   Tagged<WasmFuncRef> func_ref;
   CHECK(trusted_instance_data->try_get_func_ref(function_index, &func_ref));
   Tagged<JSFunction> external_function;
-  CHECK(func_ref->internal()->try_get_external(&external_function));
+  CHECK(func_ref->internal(isolate)->try_get_external(&external_function));
   external_function->set_code(*wrapper_code);
   Tagged<WasmExportedFunctionData> function_data =
       external_function->shared()->wasm_exported_function_data();
@@ -538,14 +545,15 @@ RUNTIME_FUNCTION(Runtime_TierUpWasmToJSWrapper) {
 
   if (IsWasmFuncRef(*origin)) {
     // The tierup for `WasmInternalFunction is special, as there is no instance.
-    size_t expected_arity = sig.parameter_count() - ref->suspend();
+    int suspender_count = ref->suspend() == wasm::kSuspendWithSuspender;
+    size_t expected_arity = sig.parameter_count() - suspender_count;
     wasm::ImportCallKind kind = wasm::kDefaultImportCallKind;
     if (IsJSFunction(ref->callable())) {
       Tagged<SharedFunctionInfo> shared =
           JSFunction::cast(ref->callable())->shared();
       expected_arity =
           shared->internal_formal_parameter_count_without_receiver();
-      if (expected_arity != sig.parameter_count() - ref->suspend()) {
+      if (expected_arity != sig.parameter_count() - suspender_count) {
         kind = wasm::ImportCallKind::kJSFunctionArityMismatch;
       }
     }
@@ -559,9 +567,9 @@ RUNTIME_FUNCTION(Runtime_TierUpWasmToJSWrapper) {
     // code may move. `call_target` would become stale then.
     Handle<WasmInternalFunction> internal_function{
         WasmFuncRef::cast(*origin)->internal(isolate), isolate};
-    internal_function->set_code(*wasm_to_js_wrapper_code);
-    // Reset a possibly existing generic wrapper in the call target.
-    internal_function->init_call_target(isolate, 0);
+    ref->set_code(*wasm_to_js_wrapper_code);
+    internal_function->set_call_target(
+        Builtins::EntryOf(Builtin::kWasmToOnHeapWasmToJsTrampoline, isolate));
     return ReadOnlyRoots(isolate).undefined_value();
   }
 
@@ -616,8 +624,9 @@ RUNTIME_FUNCTION(Runtime_TierUpWasmToJSWrapper) {
   DCHECK_NE(wasm::ImportCallKind::kLinkError, kind);
   wasm::CompilationEnv env = wasm::CompilationEnv::ForModule(native_module);
   // {expected_arity} should only be used if kind != kJSFunctionArityMismatch.
+  int suspender_count = resolved.suspend() == wasm::kSuspendWithSuspender;
   int expected_arity =
-      static_cast<int>(sig.parameter_count()) - resolved.suspend();
+      static_cast<int>(sig.parameter_count()) - suspender_count;
   if (kind == wasm::ImportCallKind ::kJSFunctionArityMismatch) {
     expected_arity = Handle<JSFunction>::cast(callable)
                          ->shared()
@@ -632,11 +641,12 @@ RUNTIME_FUNCTION(Runtime_TierUpWasmToJSWrapper) {
         &env, kind, &sig, false, expected_arity, suspend);
     std::unique_ptr<wasm::WasmCode> compiled_code = native_module->AddCode(
         result.func_index, result.code_desc, result.frame_slot_count,
-        result.tagged_parameter_slots,
+        result.ool_spill_count, result.tagged_parameter_slots,
         result.protected_instructions_data.as_vector(),
         result.source_positions.as_vector(),
-        result.inlining_positions.as_vector(), GetCodeKind(result),
-        wasm::ExecutionTier::kNone, wasm::kNotForDebugging);
+        result.inlining_positions.as_vector(), result.deopt_data.as_vector(),
+        GetCodeKind(result), wasm::ExecutionTier::kNone,
+        wasm::kNotForDebugging);
     wasm_code = native_module->PublishCode(std::move(compiled_code));
     isolate->counters()->wasm_generated_code_size()->Increment(
         wasm_code->instructions().length());
@@ -693,7 +703,16 @@ RUNTIME_FUNCTION(Runtime_WasmTriggerTierUp) {
     DCHECK_EQ(trusted_data, frame_finder.frame()->trusted_instance_data());
 
     if (V8_UNLIKELY(v8_flags.wasm_sync_tier_up)) {
-      wasm::TierUpNowForTesting(isolate, trusted_data, func_index);
+      if (!trusted_data->module_object()->native_module()->HasCodeWithTier(
+              func_index, wasm::ExecutionTier::kTurbofan)) {
+        wasm::TierUpNowForTesting(isolate, trusted_data, func_index);
+      }
+      // We call this function when the tiering budget runs out, so reset that
+      // budget to appropriately delay the next call.
+      int array_index =
+          wasm::declared_function_index(trusted_data->module(), func_index);
+      trusted_data->tiering_budget_array()[array_index] =
+          v8_flags.wasm_tiering_budget;
     } else {
       wasm::TriggerTierUp(isolate, trusted_data, func_index);
     }
@@ -848,11 +867,15 @@ RUNTIME_FUNCTION(Runtime_WasmFunctionTableSet) {
       WasmTableObject::cast(trusted_instance_data->tables()->get(table_index)),
       isolate);
   // We only use the runtime call for lazily initialized function references.
-  DCHECK(
-      IsUndefined(table->instance())
-          ? table->type() == wasm::kWasmFuncRef
-          : IsSubtypeOf(table->type(), wasm::kWasmFuncRef,
-                        WasmInstanceObject::cast(table->instance())->module()));
+  DCHECK(IsUndefined(table->instance())
+             ? table->type() == wasm::kWasmFuncRef
+             : (IsSubtypeOf(
+                    table->type(), wasm::kWasmFuncRef,
+                    WasmInstanceObject::cast(table->instance())->module()) ||
+                IsSubtypeOf(
+                    table->type(),
+                    wasm::ValueType::RefNull(wasm::HeapType::kFuncShared),
+                    WasmInstanceObject::cast(table->instance())->module())));
 
   if (!table->is_in_bounds(entry_index)) {
     return ThrowWasmError(isolate, MessageTemplate::kWasmTrapTableOutOfBounds);
@@ -878,10 +901,11 @@ RUNTIME_FUNCTION(Runtime_WasmTableInit) {
 
   DCHECK(!isolate->context().is_null());
 
+  // TODO(14616): Pass the correct instance data.
   base::Optional<MessageTemplate> opt_error =
-      WasmTrustedInstanceData::InitTableEntries(isolate, trusted_instance_data,
-                                                table_index, elem_segment_index,
-                                                dst, src, count);
+      WasmTrustedInstanceData::InitTableEntries(
+          isolate, trusted_instance_data, trusted_instance_data, table_index,
+          elem_segment_index, dst, src, count);
   if (opt_error.has_value()) {
     return ThrowWasmError(isolate, opt_error.value());
   }
@@ -1160,8 +1184,10 @@ RUNTIME_FUNCTION(Runtime_WasmArrayNewSegment) {
       return ThrowWasmError(
           isolate, MessageTemplate::kWasmTrapElementSegmentOutOfBounds);
     }
+    // TODO(14616): Pass the correct instance data.
     Handle<Object> result = isolate->factory()->NewWasmArrayFromElementSegment(
-        trusted_instance_data, segment_index, offset, length, rtt);
+        trusted_instance_data, trusted_instance_data, segment_index, offset,
+        length, rtt);
     if (IsSmi(*result)) {
       return ThrowWasmError(
           isolate, static_cast<MessageTemplate>(Smi::cast(*result).value()));
@@ -1243,8 +1269,10 @@ RUNTIME_FUNCTION(Runtime_WasmArrayInitSegment) {
     // now.
     AccountingAllocator allocator;
     Zone zone(&allocator, ZONE_NAME);
-    base::Optional<MessageTemplate> opt_error = wasm::InitializeElementSegment(
-        &zone, isolate, trusted_instance_data, segment_index);
+    // TODO(14616): Fix the instance data.
+    base::Optional<MessageTemplate> opt_error =
+        wasm::InitializeElementSegment(&zone, isolate, trusted_instance_data,
+                                       trusted_instance_data, segment_index);
     if (opt_error.has_value()) {
       return ThrowWasmError(isolate, opt_error.value());
     }
@@ -1356,23 +1384,22 @@ RUNTIME_FUNCTION(Runtime_WasmStringNewWtf8) {
       WasmTrustedInstanceData::cast(args[0]);
   uint32_t memory = args.positive_smi_value_at(1);
   uint32_t utf8_variant_value = args.positive_smi_value_at(2);
-  uint32_t offset = NumberToUint32(args[3]);
+  double offset_double = args.number_value_at(3);
+  uintptr_t offset = static_cast<uintptr_t>(offset_double);
   uint32_t size = NumberToUint32(args[4]);
 
-  // TODO(14261): Support multiple memories.
-  CHECK_EQ(memory, 0);
   DCHECK(utf8_variant_value <=
          static_cast<uint32_t>(unibrow::Utf8Variant::kLastUtf8Variant));
 
   auto utf8_variant = static_cast<unibrow::Utf8Variant>(utf8_variant_value);
 
-  uint64_t mem_size = trusted_instance_data->memory0_size();
+  uint64_t mem_size = trusted_instance_data->memory_size(memory);
   if (!base::IsInBounds<uint64_t>(offset, size, mem_size)) {
     return ThrowWasmError(isolate, MessageTemplate::kWasmTrapMemOutOfBounds);
   }
 
   const base::Vector<const uint8_t> bytes{
-      trusted_instance_data->memory0_start() + offset, size};
+      trusted_instance_data->memory_base(memory) + offset, size};
   MaybeHandle<v8::internal::String> result_string =
       isolate->factory()->NewStringFromUtf8(bytes, utf8_variant);
   if (utf8_variant == unibrow::Utf8Variant::kUtf8NoTrap) {
@@ -1417,13 +1444,11 @@ RUNTIME_FUNCTION(Runtime_WasmStringNewWtf16) {
   Tagged<WasmTrustedInstanceData> trusted_instance_data =
       WasmTrustedInstanceData::cast(args[0]);
   uint32_t memory = args.positive_smi_value_at(1);
-  uint32_t offset = NumberToUint32(args[2]);
+  double offset_double = args.number_value_at(2);
+  uintptr_t offset = static_cast<uintptr_t>(offset_double);
   uint32_t size_in_codeunits = NumberToUint32(args[3]);
 
-  // TODO(14261): Support multiple memories.
-  CHECK_EQ(memory, 0);
-
-  uint64_t mem_size = trusted_instance_data->memory0_size();
+  uint64_t mem_size = trusted_instance_data->memory_size(memory);
   if (size_in_codeunits > kMaxUInt32 / 2 ||
       !base::IsInBounds<uint64_t>(offset, size_in_codeunits * 2, mem_size)) {
     return ThrowWasmError(isolate, MessageTemplate::kWasmTrapMemOutOfBounds);
@@ -1432,7 +1457,7 @@ RUNTIME_FUNCTION(Runtime_WasmStringNewWtf16) {
     return ThrowWasmError(isolate, MessageTemplate::kWasmTrapUnalignedAccess);
   }
 
-  const uint8_t* bytes = trusted_instance_data->memory0_start() + offset;
+  const uint8_t* bytes = trusted_instance_data->memory_base(memory) + offset;
   const base::uc16* codeunits = reinterpret_cast<const base::uc16*>(bytes);
   RETURN_RESULT_OR_TRAP(isolate->factory()->NewStringFromTwoByteLittleEndian(
       {codeunits, size_in_codeunits}));
@@ -1671,19 +1696,18 @@ RUNTIME_FUNCTION(Runtime_WasmStringEncodeWtf8) {
   uint32_t memory = args.positive_smi_value_at(1);
   uint32_t utf8_variant_value = args.positive_smi_value_at(2);
   Handle<String> string(String::cast(args[3]), isolate);
-  uint32_t offset = NumberToUint32(args[4]);
+  double offset_double = args.number_value_at(4);
+  uintptr_t offset = static_cast<uintptr_t>(offset_double);
 
-  // TODO(14261): Support multiple memories.
-  CHECK_EQ(memory, 0);
   DCHECK(utf8_variant_value <=
          static_cast<uint32_t>(unibrow::Utf8Variant::kLastUtf8Variant));
 
   char* memory_start =
-      reinterpret_cast<char*>(trusted_instance_data->memory0_start());
+      reinterpret_cast<char*>(trusted_instance_data->memory_base(memory));
   auto utf8_variant = static_cast<unibrow::Utf8Variant>(utf8_variant_value);
   auto get_writable_bytes =
       [&](const DisallowGarbageCollection&) -> base::Vector<char> {
-    return {memory_start, trusted_instance_data->memory0_size()};
+    return {memory_start, trusted_instance_data->memory_size(memory)};
   };
   return EncodeWtf8(isolate, utf8_variant, string, get_writable_bytes, offset,
                     MessageTemplate::kWasmTrapMemOutOfBounds);
@@ -1745,15 +1769,14 @@ RUNTIME_FUNCTION(Runtime_WasmStringEncodeWtf16) {
       WasmTrustedInstanceData::cast(args[0]);
   uint32_t memory = args.positive_smi_value_at(1);
   Tagged<String> string = String::cast(args[2]);
-  uint32_t offset = NumberToUint32(args[3]);
+  double offset_double = args.number_value_at(3);
+  uintptr_t offset = static_cast<uintptr_t>(offset_double);
   uint32_t start = args.positive_smi_value_at(4);
   uint32_t length = args.positive_smi_value_at(5);
 
-  // TODO(14261): Support multiple memories.
-  CHECK_EQ(memory, 0);
   DCHECK(base::IsInBounds<uint32_t>(start, length, string->length()));
 
-  size_t mem_size = trusted_instance_data->memory0_size();
+  size_t mem_size = trusted_instance_data->memory_size(memory);
   static_assert(String::kMaxLength <=
                 (std::numeric_limits<size_t>::max() / sizeof(base::uc16)));
   if (!base::IsInBounds<size_t>(offset, length * sizeof(base::uc16),
@@ -1766,7 +1789,7 @@ RUNTIME_FUNCTION(Runtime_WasmStringEncodeWtf16) {
 
 #if defined(V8_TARGET_LITTLE_ENDIAN)
   uint16_t* dst = reinterpret_cast<uint16_t*>(
-      trusted_instance_data->memory0_start() + offset);
+      trusted_instance_data->memory_base(memory) + offset);
   String::WriteToFlat(string, dst, start, length);
 #elif defined(V8_TARGET_BIG_ENDIAN)
   // TODO(12868): The host is big-endian but we need to write the string
@@ -1802,15 +1825,17 @@ RUNTIME_FUNCTION(Runtime_WasmStringAsWtf8) {
 
 RUNTIME_FUNCTION(Runtime_WasmStringViewWtf8Encode) {
   ClearThreadInWasmScope flag_scope(isolate);
-  DCHECK_EQ(6, args.length());
+  DCHECK_EQ(7, args.length());
   HandleScope scope(isolate);
   Tagged<WasmTrustedInstanceData> trusted_instance_data =
       WasmTrustedInstanceData::cast(args[0]);
   uint32_t utf8_variant_value = args.positive_smi_value_at(1);
   Handle<ByteArray> array(ByteArray::cast(args[2]), isolate);
-  uint32_t addr = NumberToUint32(args[3]);
+  double addr_double = args.number_value_at(3);
+  uintptr_t addr = static_cast<uintptr_t>(addr_double);
   uint32_t start = NumberToUint32(args[4]);
   uint32_t end = NumberToUint32(args[5]);
+  uint32_t memory = args.positive_smi_value_at(6);
 
   DCHECK(utf8_variant_value <=
          static_cast<uint32_t>(unibrow::Utf8Variant::kLastUtf8Variant));
@@ -1820,16 +1845,12 @@ RUNTIME_FUNCTION(Runtime_WasmStringViewWtf8Encode) {
   auto utf8_variant = static_cast<unibrow::Utf8Variant>(utf8_variant_value);
   size_t length = end - start;
 
-  // TODO(14261): Support multiple memories.
-  CHECK_EQ(1, trusted_instance_data->module()->memories.size());
-
   if (!base::IsInBounds<size_t>(addr, length,
-                                trusted_instance_data->memory0_size())) {
+                                trusted_instance_data->memory_size(memory))) {
     return ThrowWasmError(isolate, MessageTemplate::kWasmTrapMemOutOfBounds);
   }
 
-  uint8_t* memory_start =
-      reinterpret_cast<uint8_t*>(trusted_instance_data->memory0_start());
+  uint8_t* memory_start = trusted_instance_data->memory_base(memory);
   const uint8_t* src = reinterpret_cast<const uint8_t*>(array->begin() + start);
   uint8_t* dst = memory_start + addr;
 

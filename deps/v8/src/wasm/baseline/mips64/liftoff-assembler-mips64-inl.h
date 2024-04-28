@@ -43,13 +43,10 @@ namespace liftoff {
 //  -----+--------------------+  <-- stack ptr (sp)
 //
 
-constexpr int kInstanceDataOffset = 2 * kSystemPointerSize;
-constexpr int kFeedbackVectorOffset = 3 * kSystemPointerSize;
-
 inline MemOperand GetStackSlot(int offset) { return MemOperand(fp, -offset); }
 
 inline MemOperand GetInstanceDataOperand() {
-  return GetStackSlot(kInstanceDataOffset);
+  return GetStackSlot(WasmLiftoffFrameConstants::kInstanceDataOffset);
 }
 
 template <typename T>
@@ -415,7 +412,7 @@ void LiftoffAssembler::AbortCompilation() {}
 
 // static
 constexpr int LiftoffAssembler::StaticStackFrameSize() {
-  return liftoff::kFeedbackVectorOffset;
+  return WasmLiftoffFrameConstants::kFeedbackVectorOffset;
 }
 
 int LiftoffAssembler::SlotSizeForType(ValueKind kind) {
@@ -510,21 +507,6 @@ void LiftoffAssembler::LoadTaggedPointerFromInstance(Register dst,
                                                      int32_t offset) {
   static_assert(kTaggedSize == kSystemPointerSize);
   Ld(dst, MemOperand(instance, offset));
-}
-
-void LiftoffAssembler::LoadExternalPointer(Register dst, Register src_addr,
-                                           int offset, ExternalPointerTag tag,
-                                           Register scratch) {
-  LoadFullPointer(dst, src_addr, offset);
-}
-
-void LiftoffAssembler::LoadExternalPointer(Register dst, Register src_addr,
-                                           int offset, Register index,
-                                           ExternalPointerTag tag,
-                                           Register scratch) {
-  MemOperand src_op = liftoff::GetMemOp(this, src_addr, index, offset, false,
-                                        kSystemPointerSizeLog2);
-  Ld(dst, src_op);
 }
 
 void LiftoffAssembler::SpillInstanceData(Register instance) {
@@ -3652,8 +3634,8 @@ void LiftoffAssembler::emit_f64x2_qfms(LiftoffRegister dst,
   bailout(kRelaxedSimd, "emit_f64x2_qfms");
 }
 
-void LiftoffAssembler::set_trap_on_oob_mem64(Register index, int oob_shift,
-                                             MemOperand oob_offset) {
+void LiftoffAssembler::set_trap_on_oob_mem64(Register index, uint64_t oob_size,
+                                             uint64_t oob_index) {
   UNREACHABLE();
 }
 

@@ -374,7 +374,7 @@ void IC::ConfigureVectorState(Handle<Name> name, Handle<Map> map,
   OnFeedbackChanged(IsLoadGlobalIC() ? "LoadGlobal" : "Monomorphic");
 }
 
-void IC::ConfigureVectorState(Handle<Name> name, MapHandles const& maps,
+void IC::ConfigureVectorState(Handle<Name> name, MapHandlesSpan maps,
                               MaybeObjectHandles* handlers) {
   DCHECK(!IsGlobalIC());
   std::vector<MapAndHandler> maps_and_handlers;
@@ -512,7 +512,7 @@ MaybeHandle<Object> LoadGlobalIC::Load(Handle<Name> name,
         // compiler inlining for all 'const' variables declared in REPL mode.
         if (nexus()->ConfigureLexicalVarMode(
                 lookup_result.context_index, lookup_result.slot_index,
-                (lookup_result.mode == VariableMode::kConst &&
+                (IsImmutableLexicalVariableMode(lookup_result.mode) &&
                  !lookup_result.is_repl_mode))) {
           TRACE_HANDLER_STATS(isolate(), LoadGlobalIC_LoadScriptContextField);
         } else {
@@ -740,10 +740,9 @@ bool IC::IsTransitionOfMonomorphicTarget(Tagged<Map> source_map,
       source_map->elements_kind(), target_elements_kind);
   Tagged<Map> transitioned_map;
   if (more_general_transition) {
-    MapHandles map_list;
-    map_list.push_back(handle(target_map, isolate_));
+    Handle<Map> single_map[1] = {handle(target_map, isolate_)};
     transitioned_map = source_map->FindElementsKindTransitionedMap(
-        isolate(), map_list, ConcurrencyMode::kSynchronous);
+        isolate(), single_map, ConcurrencyMode::kSynchronous);
   }
   return transitioned_map == target_map;
 }
@@ -960,7 +959,8 @@ MaybeObjectHandle LoadIC::ComputeHandler(LookupIterator* lookup) {
         }
 
         Handle<Object> getter(accessor_pair->getter(), isolate());
-        if (!IsJSFunction(*getter) && !IsFunctionTemplateInfo(*getter)) {
+        if (!IsCallableJSFunction(*getter) &&
+            !IsFunctionTemplateInfo(*getter)) {
           // TODO(jgruber): Update counter name.
           TRACE_HANDLER_STATS(isolate(), LoadIC_SlowStub);
           return MaybeObjectHandle(LoadHandler::LoadSlow(isolate()));
@@ -1006,9 +1006,11 @@ MaybeObjectHandle LoadIC::ComputeHandler(LookupIterator* lookup) {
         }
 
         if (holder->HasFastProperties()) {
-          TRACE_HANDLER_STATS(isolate(), LoadIC_LoadAccessorDH);
-          if (holder_is_lookup_start_object)
+          DCHECK(IsCallableJSFunction(*getter));
+          if (holder_is_lookup_start_object) {
+            TRACE_HANDLER_STATS(isolate(), LoadIC_LoadAccessorDH);
             return MaybeObjectHandle::Weak(accessor_pair);
+          }
           TRACE_HANDLER_STATS(isolate(), LoadIC_LoadAccessorFromPrototypeDH);
           return MaybeObjectHandle(LoadHandler::LoadFromPrototype(
               isolate(), map, holder,
@@ -1242,7 +1244,10 @@ void KeyedLoadIC::UpdateLoadElement(Handle<HeapObject> receiver,
   if (target_receiver_maps.size() == 1) {
     ConfigureVectorState(Handle<Name>(), target_receiver_maps[0], handlers[0]);
   } else {
-    ConfigureVectorState(Handle<Name>(), target_receiver_maps, &handlers);
+    ConfigureVectorState(Handle<Name>(),
+                         MapHandlesSpan(target_receiver_maps.begin(),
+                                        target_receiver_maps.end()),
+                         &handlers);
   }
 }
 
@@ -1439,7 +1444,9 @@ void KeyedLoadIC::LoadElementPolymorphicHandlers(
     // generate an elements kind transition for this kind of receivers.
     if (receiver_map->is_stable()) {
       Tagged<Map> tmap = receiver_map->FindElementsKindTransitionedMap(
-          isolate(), *receiver_maps, ConcurrencyMode::kSynchronous);
+          isolate(),
+          MapHandlesSpan(receiver_maps->begin(), receiver_maps->end()),
+          ConcurrencyMode::kSynchronous);
       if (!tmap.is_null()) {
         receiver_map->NotifyLeafMapLayoutChange(isolate());
       }
@@ -1711,7 +1718,7 @@ MaybeHandle<Object> StoreGlobalIC::Store(Handle<Name> name,
     DisableGCMole no_gcmole;
     Tagged<Context> script_context =
         script_contexts->get(lookup_result.context_index);
-    if (lookup_result.mode == VariableMode::kConst) {
+    if (IsImmutableLexicalVariableMode(lookup_result.mode)) {
       AllowGarbageCollection yes_gc;
       return TypeError(MessageTemplate::kConstAssign, global, name);
     }
@@ -1740,7 +1747,7 @@ MaybeHandle<Object> StoreGlobalIC::Store(Handle<Name> name,
     if (use_ic) {
       if (nexus()->ConfigureLexicalVarMode(
               lookup_result.context_index, lookup_result.slot_index,
-              lookup_result.mode == VariableMode::kConst)) {
+              IsImmutableLexicalVariableMode(lookup_result.mode))) {
         TRACE_HANDLER_STATS(isolate(), StoreGlobalIC_StoreScriptContextField);
       } else {
         // Given combination of indices can't be encoded, so use slow stub.
@@ -1838,15 +1845,11 @@ MaybeHandle<Object> StoreIC::Store(Handle<Object> object, Handle<Name> name,
     DCHECK(!name->IsPrivateName());
 
     PropertyKey key(isolate(), name);
-    LookupIterator it(
-        isolate(), object, key,
-        IsDefineNamedOwnIC() ? LookupIterator::OWN : LookupIterator::DEFAULT);
-    // TODO(v8:12548): refactor DefinedNamedOwnIC and SetNamedIC as subclasses
-    // of StoreIC so their logic doesn't get mixed here.
     if (IsDefineNamedOwnIC()) {
-      MAYBE_RETURN_NULL(
-          JSReceiver::CreateDataProperty(&it, value, Nothing<ShouldThrow>()));
+      MAYBE_RETURN_NULL(JSReceiver::CreateDataProperty(
+          isolate(), object, key, value, Nothing<ShouldThrow>()));
     } else {
+      LookupIterator it(isolate(), object, key, LookupIterator::DEFAULT);
       MAYBE_RETURN_NULL(Object::SetProperty(&it, value, StoreOrigin::kNamed));
     }
     return value;
@@ -2046,6 +2049,11 @@ MaybeObjectHandle StoreIC::ComputeHandler(LookupIterator* lookup) {
       Handle<JSObject> holder = lookup->GetHolder<JSObject>();
       DCHECK(!IsAccessCheckNeeded(*receiver) || lookup->name()->IsPrivate());
 
+      if (IsAnyDefineOwn()) {
+        set_slow_stub_reason("define own with existing accessor");
+        TRACE_HANDLER_STATS(isolate(), StoreIC_SlowStub);
+        return MaybeObjectHandle(StoreHandler::StoreSlow(isolate()));
+      }
       if (!holder->HasFastProperties()) {
         set_slow_stub_reason("accessor on slow map");
         TRACE_HANDLER_STATS(isolate(), StoreIC_SlowStub);
@@ -2080,9 +2088,11 @@ MaybeObjectHandle StoreIC::ComputeHandler(LookupIterator* lookup) {
             isolate(), lookup_start_object_map(), holder, *smi_handler));
 
       } else if (IsAccessorPair(*accessors)) {
-        Handle<Object> setter(Handle<AccessorPair>::cast(accessors)->setter(),
-                              isolate());
-        if (!IsJSFunction(*setter) && !IsFunctionTemplateInfo(*setter)) {
+        Handle<AccessorPair> accessor_pair =
+            Handle<AccessorPair>::cast(accessors);
+        Handle<Object> setter(accessor_pair->setter(), isolate());
+        if (!IsCallableJSFunction(*setter) &&
+            !IsFunctionTemplateInfo(*setter)) {
           set_slow_stub_reason("setter not a function");
           TRACE_HANDLER_STATS(isolate(), StoreIC_SlowStub);
           return MaybeObjectHandle(StoreHandler::StoreSlow(isolate()));
@@ -2127,17 +2137,17 @@ MaybeObjectHandle StoreIC::ComputeHandler(LookupIterator* lookup) {
           return MaybeObjectHandle(StoreHandler::StoreSlow(isolate()));
         }
 
-        Handle<Smi> smi_handler =
-            StoreHandler::StoreAccessor(isolate(), lookup->GetAccessorIndex());
-
-        TRACE_HANDLER_STATS(isolate(), StoreIC_StoreAccessorDH);
+        DCHECK(IsCallableJSFunction(*setter));
         if (receiver.is_identical_to(holder)) {
-          return MaybeObjectHandle(smi_handler);
+          TRACE_HANDLER_STATS(isolate(), StoreIC_StoreAccessorDH);
+          return MaybeObjectHandle::Weak(accessor_pair);
         }
         TRACE_HANDLER_STATS(isolate(), StoreIC_StoreAccessorOnPrototypeDH);
 
         return MaybeObjectHandle(StoreHandler::StoreThroughPrototype(
-            isolate(), lookup_start_object_map(), holder, *smi_handler));
+            isolate(), lookup_start_object_map(), holder,
+            *StoreHandler::StoreAccessorFromPrototype(isolate()),
+            MaybeObjectHandle::Weak(setter)));
       }
       TRACE_HANDLER_STATS(isolate(), StoreIC_SlowStub);
       return MaybeObjectHandle(StoreHandler::StoreSlow(isolate()));
@@ -2466,7 +2476,9 @@ void KeyedStoreIC::StoreElementPolymorphicHandlers(
     } else {
       {
         Tagged<Map> tmap = receiver_map->FindElementsKindTransitionedMap(
-            isolate(), receiver_maps, ConcurrencyMode::kSynchronous);
+            isolate(),
+            MapHandlesSpan(receiver_maps.begin(), receiver_maps.end()),
+            ConcurrencyMode::kSynchronous);
         if (!tmap.is_null()) {
           if (receiver_map->is_stable()) {
             receiver_map->NotifyLeafMapLayoutChange(isolate());
@@ -2964,11 +2976,9 @@ RUNTIME_FUNCTION(Runtime_DefineNamedOwnIC_Slow) {
   DCHECK(!IsSymbol(*key) || !Symbol::cast(*key)->is_private_name());
 
   PropertyKey lookup_key(isolate, key);
-  LookupIterator it(isolate, object, lookup_key, LookupIterator::OWN);
-
-  MAYBE_RETURN(
-      JSReceiver::CreateDataProperty(&it, value, Nothing<ShouldThrow>()),
-      ReadOnlyRoots(isolate).exception());
+  MAYBE_RETURN(JSReceiver::CreateDataProperty(isolate, object, lookup_key,
+                                              value, Nothing<ShouldThrow>()),
+               ReadOnlyRoots(isolate).exception());
   return *value;
 }
 
@@ -3032,7 +3042,7 @@ RUNTIME_FUNCTION(Runtime_StoreGlobalIC_Slow) {
   if (script_contexts->Lookup(name, &lookup_result)) {
     Handle<Context> script_context =
         handle(script_contexts->get(lookup_result.context_index), isolate);
-    if (lookup_result.mode == VariableMode::kConst) {
+    if (IsImmutableLexicalVariableMode(lookup_result.mode)) {
       THROW_NEW_ERROR_RETURN_FAILURE(
           isolate, NewTypeError(MessageTemplate::kConstAssign, global, name));
     }

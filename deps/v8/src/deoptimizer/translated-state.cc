@@ -83,7 +83,6 @@ void DeoptimizationFrameTranslationPrintSingleOpcode(
          << ", height=" << height << "}";
       break;
     }
-
 #endif
     case TranslationOpcode::CONSTRUCT_CREATE_STUB_FRAME: {
       DCHECK_EQ(TranslationOpcodeOperandCount(opcode), 2);
@@ -131,6 +130,14 @@ void DeoptimizationFrameTranslationPrintSingleOpcode(
          << SharedFunctionInfo::cast(shared_info)->DebugNameCStr().get()
          << ", height=" << height << ", wasm_return_type=" << wasm_return_type
          << "}";
+      break;
+    }
+
+    case v8::internal::TranslationOpcode::LIFTOFF_FRAME: {
+      DCHECK_EQ(TranslationOpcodeOperandCount(opcode), 2);
+      int bailout_id = iterator.NextOperand();
+      unsigned height = iterator.NextOperand();
+      os << "{bailout_id=" << bailout_id << ", height=" << height << "}";
       break;
     }
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -314,6 +321,11 @@ void DeoptimizationFrameTranslationPrintSingleOpcode(
     case TranslationOpcode::ARGUMENTS_LENGTH: {
       DCHECK_EQ(TranslationOpcodeOperandCount(opcode), 0);
       os << "{arguments_length}";
+      break;
+    }
+    case TranslationOpcode::REST_LENGTH: {
+      DCHECK_EQ(TranslationOpcodeOperandCount(opcode), 0);
+      os << "{rest_length}";
       break;
     }
 
@@ -817,6 +829,16 @@ TranslatedFrame TranslatedFrame::JSToWasmBuiltinContinuationFrame(
   frame.return_kind_ = return_kind;
   return frame;
 }
+
+TranslatedFrame TranslatedFrame::LiftoffFrame(
+    BytecodeOffset bytecode_offset, int height) {
+  // WebAssembly functions do not have a SharedFunctionInfo on the stack.
+  // The deoptimizer has to recover the function-specific data based on the PC.
+  Tagged<SharedFunctionInfo> shared_info;
+  TranslatedFrame frame(kLiftoffFunction, shared_info, height);
+  frame.bytecode_offset_ = bytecode_offset;
+  return frame;
+}
 #endif  // V8_ENABLE_WEBASSEMBLY
 
 TranslatedFrame TranslatedFrame::JavaScriptBuiltinContinuationFrame(
@@ -870,6 +892,9 @@ int TranslatedFrame::GetValueCount() {
       static constexpr int kTheContext = 1;
       return height() + kTheContext + kTheFunction;
     }
+    case kLiftoffFunction: {
+      return height();
+    }
 #endif  // V8_ENABLE_WEBASSEMBLY
 
     case kInvalid:
@@ -889,7 +914,7 @@ void TranslatedFrame::Handlify(Isolate* isolate) {
 }
 
 TranslatedFrame TranslatedState::CreateNextTranslatedFrame(
-    DeoptimizationFrameTranslation::Iterator* iterator,
+    DeoptTranslationIterator* iterator,
     Tagged<DeoptimizationLiteralArray> literal_array, Address fp,
     FILE* trace_file) {
   TranslationOpcode opcode = iterator->NextOpcode();
@@ -1015,6 +1040,17 @@ TranslatedFrame TranslatedState::CreateNextTranslatedFrame(
       return TranslatedFrame::JSToWasmBuiltinContinuationFrame(
           bailout_id, shared_info, height, return_kind);
     }
+
+    case TranslationOpcode::LIFTOFF_FRAME: {
+      BytecodeOffset bailout_id = BytecodeOffset(iterator->NextOperand());
+      int height = iterator->NextOperand();
+      if (trace_file != nullptr) {
+        PrintF(trace_file, "  reading input for liftoff frame");
+        PrintF(trace_file, " => bailout_id=%d, height=%d ; inputs:\n",
+               bailout_id.ToInt(), height);
+      }
+      return TranslatedFrame::LiftoffFrame(bailout_id, height);
+    }
 #endif  // V8_ENABLE_WEBASSEMBLY
 
     case TranslationOpcode::JAVA_SCRIPT_BUILTIN_CONTINUATION_FRAME: {
@@ -1055,6 +1091,7 @@ TranslatedFrame TranslatedState::CreateNextTranslatedFrame(
     case TranslationOpcode::DUPLICATED_OBJECT:
     case TranslationOpcode::ARGUMENTS_ELEMENTS:
     case TranslationOpcode::ARGUMENTS_LENGTH:
+    case TranslationOpcode::REST_LENGTH:
     case TranslationOpcode::CAPTURED_OBJECT:
     case TranslationOpcode::REGISTER:
     case TranslationOpcode::INT32_REGISTER:
@@ -1158,13 +1195,13 @@ void TranslatedState::CreateArgumentsElementsTranslatedValues(
 // infrastracture is not GC safe.
 // Thus we build a temporary structure in malloced space.
 // The TranslatedValue objects created correspond to the static translation
-// instructions from the DeoptimizationFrameTranslation::Iterator, except for
+// instructions from the DeoptTranslationIterator, except for
 // TranslationOpcode::ARGUMENTS_ELEMENTS, where the number and values of the
 // FixedArray elements depend on dynamic information from the optimized frame.
 // Returns the number of expected nested translations from the
-// DeoptimizationFrameTranslation::Iterator.
+// DeoptTranslationIterator.
 int TranslatedState::CreateNextTranslatedValue(
-    int frame_index, DeoptimizationFrameTranslation::Iterator* iterator,
+    int frame_index, DeoptTranslationIterator* iterator,
     Tagged<DeoptimizationLiteralArray> literal_array, Address fp,
     RegisterValues* registers, FILE* trace_file) {
   disasm::NameConverter converter;
@@ -1187,6 +1224,7 @@ int TranslatedState::CreateNextTranslatedValue(
 #if V8_ENABLE_WEBASSEMBLY
     case TranslationOpcode::WASM_INLINED_INTO_JS_FRAME:
     case TranslationOpcode::JS_TO_WASM_BUILTIN_CONTINUATION_FRAME:
+    case TranslationOpcode::LIFTOFF_FRAME:
 #endif  // V8_ENABLE_WEBASSEMBLY
     case TranslationOpcode::UPDATE_FEEDBACK:
     case TranslationOpcode::MATCH_PREVIOUS_TRANSLATION:
@@ -1219,6 +1257,16 @@ int TranslatedState::CreateNextTranslatedValue(
                actual_argument_count_);
       }
       frame.Add(TranslatedValue::NewInt32(this, actual_argument_count_));
+      return 0;
+    }
+
+    case TranslationOpcode::REST_LENGTH: {
+      int rest_length =
+          std::max(0, actual_argument_count_ - formal_parameter_count_);
+      if (trace_file != nullptr) {
+        PrintF(trace_file, "rest length field (length = %d)", rest_length);
+      }
+      frame.Add(TranslatedValue::NewInt32(this, rest_length));
       return 0;
     }
 
@@ -1601,7 +1649,8 @@ int TranslatedState::CreateNextTranslatedValue(
 }
 
 Address TranslatedState::DecompressIfNeeded(intptr_t value) {
-  if (COMPRESS_POINTERS_BOOL) {
+  if (COMPRESS_POINTERS_BOOL &&
+      static_cast<uintptr_t>(value) <= std::numeric_limits<uint32_t>::max()) {
     return V8HeapCompressionScheme::DecompressTagged(
         isolate(), static_cast<uint32_t>(value));
   } else {
@@ -1629,7 +1678,7 @@ TranslatedState::TranslatedState(const JavaScriptFrame* frame)
 
 void TranslatedState::Init(Isolate* isolate, Address input_frame_pointer,
                            Address stack_frame_pointer,
-                           DeoptimizationFrameTranslation::Iterator* iterator,
+                           DeoptTranslationIterator* iterator,
                            Tagged<DeoptimizationLiteralArray> literal_array,
                            RegisterValues* registers, FILE* trace_file,
                            int formal_parameter_count,
@@ -2505,7 +2554,7 @@ bool TranslatedState::DoUpdateFeedback() {
 }
 
 void TranslatedState::ReadUpdateFeedback(
-    DeoptimizationFrameTranslation::Iterator* iterator,
+    DeoptTranslationIterator* iterator,
     Tagged<DeoptimizationLiteralArray> literal_array, FILE* trace_file) {
   CHECK_EQ(TranslationOpcode::UPDATE_FEEDBACK, iterator->NextOpcode());
   feedback_vector_ =

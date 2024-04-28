@@ -129,8 +129,8 @@ class WasmGCTypedOptimizationReducer : public Next {
     Next::Analyze();
   }
 
-  OpIndex REDUCE_INPUT_GRAPH(WasmTypeCast)(OpIndex op_idx,
-                                           const WasmTypeCastOp& cast_op) {
+  V<Object> REDUCE_INPUT_GRAPH(WasmTypeCast)(V<Object> op_idx,
+                                             const WasmTypeCastOp& cast_op) {
     LABEL_BLOCK(no_change) {
       return Next::ReduceInputGraphWasmTypeCast(op_idx, cast_op);
     }
@@ -165,8 +165,7 @@ class WasmGCTypedOptimizationReducer : public Next {
                                                               cast_op.object()),
                                                           type)
                                               : __ Word32Constant(0);
-        __ TrapIfNot(non_trapping_condition, OpIndex::Invalid(),
-                     TrapId::kTrapIllegalCast);
+        __ TrapIfNot(non_trapping_condition, {}, TrapId::kTrapIllegalCast);
         if (!to_nullable) {
           __ Unreachable();
         }
@@ -184,8 +183,8 @@ class WasmGCTypedOptimizationReducer : public Next {
     goto no_change;
   }
 
-  OpIndex REDUCE_INPUT_GRAPH(WasmTypeCheck)(OpIndex op_idx,
-                                            const WasmTypeCheckOp& type_check) {
+  V<Word32> REDUCE_INPUT_GRAPH(WasmTypeCheck)(
+      V<Word32> op_idx, const WasmTypeCheckOp& type_check) {
     LABEL_BLOCK(no_change) {
       return Next::ReduceInputGraphWasmTypeCheck(op_idx, type_check);
     }
@@ -232,8 +231,8 @@ class WasmGCTypedOptimizationReducer : public Next {
     goto no_change;
   }
 
-  OpIndex REDUCE_INPUT_GRAPH(AssertNotNull)(
-      OpIndex op_idx, const AssertNotNullOp& assert_not_null) {
+  V<Object> REDUCE_INPUT_GRAPH(AssertNotNull)(
+      V<Object> op_idx, const AssertNotNullOp& assert_not_null) {
     LABEL_BLOCK(no_change) {
       return Next::ReduceInputGraphAssertNotNull(op_idx, assert_not_null);
     }
@@ -246,7 +245,8 @@ class WasmGCTypedOptimizationReducer : public Next {
     goto no_change;
   }
 
-  OpIndex REDUCE_INPUT_GRAPH(IsNull)(OpIndex op_idx, const IsNullOp& is_null) {
+  V<Word32> REDUCE_INPUT_GRAPH(IsNull)(V<Word32> op_idx,
+                                       const IsNullOp& is_null) {
     LABEL_BLOCK(no_change) {
       return Next::ReduceInputGraphIsNull(op_idx, is_null);
     }
@@ -263,8 +263,8 @@ class WasmGCTypedOptimizationReducer : public Next {
     goto no_change;
   }
 
-  OpIndex REDUCE_INPUT_GRAPH(WasmTypeAnnotation)(
-      OpIndex op_idx, const WasmTypeAnnotationOp& type_annotation) {
+  V<Object> REDUCE_INPUT_GRAPH(WasmTypeAnnotation)(
+      V<Object> op_idx, const WasmTypeAnnotationOp& type_annotation) {
     // Remove type annotation operations as they are not needed any more.
     return __ MapToNewGraph(type_annotation.value());
   }
@@ -306,8 +306,8 @@ class WasmGCTypedOptimizationReducer : public Next {
     goto no_change;
   }
 
-  OpIndex REDUCE_INPUT_GRAPH(ArrayLength)(OpIndex op_idx,
-                                          const ArrayLengthOp& array_length) {
+  V<Word32> REDUCE_INPUT_GRAPH(ArrayLength)(V<Word32> op_idx,
+                                            const ArrayLengthOp& array_length) {
     LABEL_BLOCK(no_change) {
       return Next::ReduceInputGraphArrayLength(op_idx, array_length);
     }
@@ -324,7 +324,7 @@ class WasmGCTypedOptimizationReducer : public Next {
 
   // TODO(14108): This isn't a type optimization and doesn't fit well into this
   // reducer.
-  OpIndex REDUCE(AnyConvertExtern)(V<Object> object) {
+  V<Object> REDUCE(AnyConvertExtern)(V<Object> object) {
     LABEL_BLOCK(no_change) { return Next::ReduceAnyConvertExtern(object); }
     if (ShouldSkipOptimizationStep()) goto no_change;
 

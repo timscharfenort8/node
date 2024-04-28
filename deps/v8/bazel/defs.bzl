@@ -109,7 +109,8 @@ def _default_args():
                 "-Werror",
                 "-Wextra",
                 "-Wno-unneeded-internal-declaration",
-                "-Wno-unknown-warning-option",
+                "-Wno-unknown-warning-option", # b/330781959
+                "-Wno-cast-function-type-mismatch",  # b/330781959
                 "-Wno-bitwise-instead-of-logical",
                 "-Wno-builtin-assume-aligned-alignment",
                 "-Wno-unused-parameter",
@@ -560,6 +561,7 @@ def build_config_content(cpu, icu):
         ("js_shared_memory", "false"),
         ("lite_mode", "false"),
         ("local_off_stack_check", "false"),
+        ("memory_corruption_api", "false"),
         ("mips_arch_variant", '""'),
         ("mips_use_msa", "false"),
         ("msan", "false"),

@@ -241,6 +241,7 @@ VisitorId Map::GetVisitorId(Tagged<Map> map) {
     case JS_ASYNC_FUNCTION_OBJECT_TYPE:
     case JS_ASYNC_GENERATOR_OBJECT_TYPE:
     case JS_CONTEXT_EXTENSION_OBJECT_TYPE:
+    case JS_DISPOSABLE_STACK_TYPE:
     case JS_DATE_TYPE:
     case JS_ERROR_TYPE:
     case JS_GENERATOR_OBJECT_TYPE:
@@ -339,9 +340,11 @@ VisitorId Map::GetVisitorId(Tagged<Map> map) {
       return kVisitJSSynchronizationPrimitive;
 
     case FILLER_TYPE:
-    case FOREIGN_TYPE:
     case HEAP_NUMBER_TYPE:
       return kVisitDataObject;
+
+    case FOREIGN_TYPE:
+      return kVisitForeign;
 
     case BIGINT_TYPE:
       return kVisitBigInt;
@@ -352,11 +355,6 @@ VisitorId Map::GetVisitorId(Tagged<Map> map) {
 #define MAKE_STRUCT_CASE(TYPE, Name, name) case TYPE:
       STRUCT_LIST(MAKE_STRUCT_CASE)
 #undef MAKE_STRUCT_CASE
-      // TODO(ishell): given that the following objects have custom visitors
-      // don't define them as Structs.
-      if (instance_type == PROMISE_ON_STACK_TYPE) {
-        return kVisitPromiseOnStack;
-      }
       if (instance_type == PROTOTYPE_INFO_TYPE) {
         return kVisitPrototypeInfo;
       }
@@ -397,8 +395,6 @@ VisitorId Map::GetVisitorId(Tagged<Map> map) {
       return kVisitWasmContinuationObject;
     case WASM_TYPE_INFO_TYPE:
       return kVisitWasmTypeInfo;
-    case WASM_INTERNAL_FUNCTION_TYPE:
-      return kVisitWasmInternalFunction;
     case WASM_JS_FUNCTION_DATA_TYPE:
       return kVisitWasmJSFunctionData;
     case WASM_RESUME_DATA_TYPE:
@@ -411,6 +407,8 @@ VisitorId Map::GetVisitorId(Tagged<Map> map) {
       return kVisitWasmCapiFunctionData;
     case WASM_SUSPENDER_OBJECT_TYPE:
       return kVisitWasmSuspenderObject;
+    case WASM_SUSPENDING_OBJECT_TYPE:
+      return kVisitWasmSuspendingObject;
     case WASM_NULL_TYPE:
       return kVisitWasmNull;
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -936,7 +934,7 @@ Handle<Map> Map::GetDerivedMap(Isolate* isolate, Handle<Map> from,
                                                        prototype);
 }
 
-static bool ContainsMap(MapHandles const& maps, Tagged<Map> map) {
+static bool ContainsMap(MapHandlesSpan maps, Tagged<Map> map) {
   DCHECK(!map.is_null());
   for (Handle<Map> current : maps) {
     if (!current.is_null() && *current == map) return true;
@@ -944,8 +942,7 @@ static bool ContainsMap(MapHandles const& maps, Tagged<Map> map) {
   return false;
 }
 
-static bool HasElementsKind(MapHandles const& maps,
-                            ElementsKind elements_kind) {
+static bool HasElementsKind(MapHandlesSpan maps, ElementsKind elements_kind) {
   for (Handle<Map> current : maps) {
     if (!current.is_null() && current->elements_kind() == elements_kind)
       return true;
@@ -954,7 +951,7 @@ static bool HasElementsKind(MapHandles const& maps,
 }
 
 Tagged<Map> Map::FindElementsKindTransitionedMap(Isolate* isolate,
-                                                 MapHandles const& candidates,
+                                                 MapHandlesSpan candidates,
                                                  ConcurrencyMode cmode) {
   DisallowGarbageCollection no_gc;
 

@@ -67,7 +67,7 @@ namespace internal {
   F(AtomicsStoreSharedStructOrArray, 3, 1)             \
   F(AtomicsExchangeSharedStructOrArray, 3, 1)          \
   F(AtomicsCompareExchangeSharedStructOrArray, 4, 1)   \
-  F(AtomicsConditionNumWaitersForTesting, 1, 1)
+  F(AtomicsSynchronizationPrimitiveNumWaitersForTesting, 1, 1)
 
 #define FOR_EACH_INTRINSIC_BIGINT(F, I) \
   F(BigIntBinaryOp, 3, 1)               \
@@ -132,15 +132,13 @@ namespace internal {
 #define FOR_EACH_INTRINSIC_DEBUG(F, I)          \
   F(ClearStepping, 0, 1)                        \
   F(CollectGarbage, 1, 1)                       \
-  F(DebugAsyncFunctionSuspended, 4, 1)          \
+  F(DebugAsyncFunctionSuspended, 3, 1)          \
   F(DebugBreakAtEntry, 1, 1)                    \
   F(DebugCollectCoverage, 0, 1)                 \
   F(DebugGetLoadedScriptIds, 0, 1)              \
   F(DebugOnFunctionCall, 2, 1)                  \
-  F(DebugPopPromise, 0, 1)                      \
   F(DebugPrepareStepInSuspendedGenerator, 0, 1) \
   F(DebugPromiseThen, 1, 1)                     \
-  F(DebugPushPromise, 1, 1)                     \
   F(DebugToggleBlockCoverage, 1, 1)             \
   F(DebugTogglePreciseCoverage, 1, 1)           \
   F(FunctionGetInferredName, 1, 1)              \
@@ -186,21 +184,18 @@ namespace internal {
   F(FunctionGetSourceCode, 1, 1)           \
   F(FunctionIsAPIFunction, 1, 1)
 
-#define FOR_EACH_INTRINSIC_GENERATOR(F, I)    \
-  I(AsyncFunctionAwaitCaught, 2, 1)           \
-  I(AsyncFunctionAwaitUncaught, 2, 1)         \
-  I(AsyncFunctionEnter, 2, 1)                 \
-  I(AsyncFunctionReject, 2, 1)                \
-  I(AsyncFunctionResolve, 2, 1)               \
-  I(AsyncGeneratorAwaitCaught, 2, 1)          \
-  I(AsyncGeneratorAwaitUncaught, 2, 1)        \
-  F(AsyncGeneratorHasCatchHandlerForPC, 1, 1) \
-  I(AsyncGeneratorReject, 2, 1)               \
-  I(AsyncGeneratorResolve, 3, 1)              \
-  I(AsyncGeneratorYieldWithAwait, 3, 1)       \
-  I(CreateJSGeneratorObject, 2, 1)            \
-  I(GeneratorClose, 1, 1)                     \
-  F(GeneratorGetFunction, 1, 1)               \
+#define FOR_EACH_INTRINSIC_GENERATOR(F, I) \
+  I(AsyncFunctionAwait, 2, 1)              \
+  I(AsyncFunctionEnter, 2, 1)              \
+  I(AsyncFunctionReject, 2, 1)             \
+  I(AsyncFunctionResolve, 2, 1)            \
+  I(AsyncGeneratorAwait, 2, 1)             \
+  I(AsyncGeneratorReject, 2, 1)            \
+  I(AsyncGeneratorResolve, 3, 1)           \
+  I(AsyncGeneratorYieldWithAwait, 2, 1)    \
+  I(CreateJSGeneratorObject, 2, 1)         \
+  I(GeneratorClose, 1, 1)                  \
+  F(GeneratorGetFunction, 1, 1)            \
   I(GeneratorGetResumeMode, 1, 1)
 
 #ifdef V8_INTL_SUPPORT
@@ -305,6 +300,7 @@ namespace internal {
 
 #define FOR_EACH_INTRINSIC_OBJECT(F, I)                                \
   F(AddDictionaryProperty, 3, 1)                                       \
+  F(AddDisposableValue, 2, 1)                                          \
   F(AddPrivateBrand, 4, 1)                                             \
   F(AllocateHeapNumber, 0, 1)                                          \
   F(CompleteInobjectSlackTrackingForMap, 1, 1)                         \
@@ -318,6 +314,7 @@ namespace internal {
   F(DefineGetterPropertyUnchecked, 4, 1)                               \
   F(DefineSetterPropertyUnchecked, 4, 1)                               \
   F(DeleteProperty, 3, 1)                                              \
+  F(DisposeDisposableStack, 3, 1)                                      \
   F(GetDerivedMap, 2, 1)                                               \
   F(GetFunctionName, 1, 1)                                             \
   F(GetOwnPropertyDescriptor, 2, 1)                                    \
@@ -328,6 +325,7 @@ namespace internal {
   F(HasFastPackedElements, 1, 1)                                       \
   F(HasInPrototypeChain, 2, 1)                                         \
   F(HasProperty, 2, 1)                                                 \
+  F(InitializeDisposableStack, 0, 1)                                   \
   F(InternalSetPrototype, 2, 1)                                        \
   F(IsJSReceiver, 1, 1)                                                \
   F(JSReceiverPreventExtensionsDontThrow, 1, 1)                        \
@@ -452,7 +450,8 @@ namespace internal {
   F(StoreLookupSlot_Sloppy, 2, 1)                  \
   F(StoreLookupSlot_SloppyHoisting, 2, 1)          \
   F(StoreLookupSlot_Strict, 2, 1)                  \
-  F(ThrowConstAssignError, 0, 1)
+  F(ThrowConstAssignError, 0, 1)                   \
+  F(ThrowUsingAssignError, 0, 1)
 
 #define FOR_EACH_INTRINSIC_SHADOW_REALM(F, I) \
   F(ShadowRealmWrappedFunctionCreate, 2, 1)   \
@@ -681,7 +680,7 @@ namespace internal {
   F(WasmStringEncodeWtf8Array, 4, 1)          \
   F(WasmStringToUtf8Array, 1, 1)              \
   F(WasmStringAsWtf8, 1, 1)                   \
-  F(WasmStringViewWtf8Encode, 6, 1)           \
+  F(WasmStringViewWtf8Encode, 7, 1)           \
   F(WasmStringViewWtf8Slice, 3, 1)            \
   F(WasmStringFromCodePoint, 1, 1)            \
   F(WasmStringHash, 1, 1)                     \
@@ -722,7 +721,8 @@ namespace internal {
   F(WasmTierUpFunction, 1, 1)                              \
   F(WasmTraceEnter, 0, 1)                                  \
   F(WasmTraceExit, 1, 1)                                   \
-  F(WasmTraceMemory, 1, 1)
+  F(WasmTraceMemory, 1, 1)                                 \
+  F(WasmNull, 0, 1)
 
 #define FOR_EACH_INTRINSIC_WEAKREF(F, I)                             \
   F(JSFinalizationRegistryRegisterWeakCellWithUnregisterToken, 4, 1) \
